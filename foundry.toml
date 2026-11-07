@@ -1,0 +1,31 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+bytecode_hash = "none"
+# Each top-level call is its own transaction, so transient storage (the reentrancy lock) clears between them.
+isolate = true
+fs_permissions = []
+# Fork suites run the whole deploy in ONE test call (~50M gas of 70+ real transactions), over a mainnet block's 60M
+# limit. Lift only the block limit: metering stays ON so Deploy.t.sol's per-transaction EIP-7825 check reads real gas.
+disable_block_gas_limit = true
+
+[profile.default.fuzz]
+runs = 256
+
+[profile.default.invariant]
+runs = 128
+depth = 64
+fail_on_revert = false
+
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC_URL}"
+
+[lint]
+lint_on_build = false
