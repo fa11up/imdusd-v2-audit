@@ -18,6 +18,7 @@ import {Pricer} from "../../src/Pricer.sol";
 import {Join} from "../../src/Join.sol";
 import {IFeed} from "../../src/interfaces/IFeed.sol";
 import {SeatJoin} from "../../src/seats/SeatJoin.sol";
+import {SeatFeed} from "../../src/feeds/SeatFeed.sol";
 import {SeatAccount, IImdAgentAdapter} from "../../src/seats/SeatAccount.sol";
 import {Adjust} from "../../src/interfaces/IPositions.sol";
 import {_pid} from "../utils/Pid.sol";
@@ -480,6 +481,11 @@ contract SeatsTest is SeatSystem {
         acct.sync(address(reward));
         acct.sync(address(reward)); // idempotent
         assertEq(seatJoin.owed(1, address(reward), alice), 50e18);
+        // Audit wave 1: the seat collection (balanceOf reads the held seat) and the join are never booked as rewards.
+        vm.expectRevert(SeatAccount.WrongToken.selector);
+        acct.sync(address(nft));
+        vm.expectRevert(SeatAccount.WrongToken.selector);
+        acct.sync(address(seatJoin));
         vm.prank(alice);
         seatJoin.withdraw(1, alice);
         assertEq(reward.balanceOf(alice), 0, "the withdrawal moves the seat and nothing else (S1)");
@@ -616,8 +622,18 @@ contract SeatsTest is SeatSystem {
 
     // ------------------------------------------------------------------ price: reflexive LTV and freeze
 
+    /// @dev A new median attestation (one second later, same price) carrying figure `f`, recorded by a poke.
+    function _relayFigure(uint256 f) private {
+        vm.warp(vm.getBlockTimestamp() + 1); // not block.timestamp: via-IR caches it within a test
+        median.set(median.value());
+        median.setFigure(f);
+        seatFeed.poke();
+    }
+
     function test_liquidityChannel() public {
-        median.setFigure(50); // half the 100-sale threshold
+        // The figure steps down at most 20% per new attestation (audit wave 1, panel 6): relay 50 until it is accepted.
+        for (uint256 i; i < 10 && seatFeed.acceptedFigure() != 50; ++i) _relayFigure(50);
+        assertEq(seatFeed.acceptedFigure(), 50, "half the 100-sale threshold");
         assertEq(seatFeed.liquidity(), 0.5e18);
         (uint256 v,) = seatFeed.latestValue();
         assertEq(v, 2_000e18, "$4,000 x 0.5");
@@ -627,8 +643,44 @@ contract SeatsTest is SeatSystem {
         ledger.open(SEAT, 0, Adjust(1e18, int256(_net(800e18) + 1e18), 0.08e18, 0, 0, false, type(uint256).max, address(0)));
         ledger.open(SEAT, 0, Adjust(1e18, int256(_net(800e18)), 0.08e18, 0, 0, false, type(uint256).max, address(0)));
         vm.stopPrank();
-        median.setFigure(300);
+        _relayFigure(300);
+        assertEq(seatFeed.acceptedFigure(), 63, "a rise steps at most 25% + 1");
+        for (uint256 i; i < 10 && seatFeed.acceptedFigure() < 100; ++i) _relayFigure(300);
         assertEq(seatFeed.liquidity(), 1e18, "capped at 1");
+    }
+
+    /// Audit wave 1, panel 6: one attestation that keeps the price and drops the figure moves the priced legs at most 20%.
+    function test_figureFallIsCappedPerAttestation() public {
+        assertEq(seatFeed.acceptedFigure(), 150);
+        (uint256 before,) = seatFeed.latestValue();
+        assertEq(before, 4_000e18);
+        median.setFigure(10); // the same attestation re-read with a lower figure: capped against the same base
+        assertEq(seatFeed.acceptedFigure(), 120);
+        (uint256 v,) = seatFeed.latestValue();
+        assertEq(v, 4_000e18, "liquidity still 1 at 120");
+        seatFeed.poke(); // record the replacement (unrecorded, the next attestation would count as the only step)
+        assertEq(seatFeed.acceptedFigure(), 120, "recording a replacement does not step it further");
+        _relayFigure(10); // a new attestation: one more 20% step, from 120
+        assertEq(seatFeed.acceptedFigure(), 96);
+        (v,) = seatFeed.latestValue();
+        assertEq(v, 3_840e18, "$4,000 x 0.96, not x 0.10");
+    }
+
+    /// Audit wave 1 (seats low): over an empty cap (fresh leaf) the type prices at 0 until a poke records the first
+    /// attestation, so no attestation before it is accepted raw.
+    function test_emptyCapPricesNothingUntilPoked() public {
+        MockSeatFeed m2 = new MockSeatFeed(0, 0);
+        SeatFeed f2 = new SeatFeed(m2, spot, ethFeed);
+        m2.set(2e18);
+        m2.setFigure(150);
+        assertEq(f2.acceptedMedian(), 0, "unrecorded: unpriced");
+        (uint256 v,) = f2.latestValue();
+        assertEq(v, 0);
+        f2.poke();
+        assertEq(f2.acceptedMedian(), 2e18, "the first recorded attestation is accepted raw");
+        vm.warp(vm.getBlockTimestamp() + 1);
+        m2.set(1e18); // a 50% fall
+        assertEq(f2.acceptedMedian(), 1.6e18, "the next one is capped");
     }
 
     function test_trendChannelTightensOnFall() public {
@@ -722,7 +774,7 @@ contract SeatsTest is SeatSystem {
 
     function test_fallCap_constant() public view {
         assertEq(seatFeed.MAX_FALL_PER_UPDATE_BPS(), 2000);
-        (uint128 base, uint128 raw, uint64 at) = seatFeed.cap();
+        (uint128 base, uint128 raw, uint64 at,,) = seatFeed.cap();
         assertEq(base, 2e18, "anchored at deployment");
         assertEq(raw, 2e18);
         assertEq(at, uint64(block.timestamp));
@@ -763,7 +815,7 @@ contract SeatsTest is SeatSystem {
         seatFeed.poke();
         seatFeed.poke();
         assertEq(seatFeed.acceptedMedian(), 1.6e18);
-        (uint128 base, uint128 raw,) = seatFeed.cap();
+        (uint128 base, uint128 raw,,,) = seatFeed.cap();
         assertEq(base, 2e18);
         assertEq(raw, 0.5e18, "the replacement is what the next update steps from");
         _attest(0.5e18);
@@ -936,6 +988,26 @@ contract SeatsTest is SeatSystem {
         (,,,, uint128 bad) = ledger.ilkState(SEAT);
         assertGt(bad, 0, "the shortfall is the type's bad debt");
         assertEq(nft.ownerOf(1), bob);
+        _assertSupply();
+        _assertUnits();
+    }
+
+    /// Audit wave 1: a seat sale's bad debt is covered in the sale's own transaction, as a bite's is.
+    function test_auctionBadDebtIsCoveredAtOnce() public {
+        _pledge(alice, 1, _net(1_600e18));
+        for (uint256 i; i < 5; ++i) _attest(0.8e18);
+        liquidator.liquidate(_pid(SEAT, alice));
+        _skip(6 hours);
+        _refresh();
+        _cash(bob, 8_000e18);
+        vm.startPrank(bob);
+        usd.transfer(address(treasury), 2_000e18); // the Treasury holds imdUSD to cover with
+        usd.approve(address(seatJoin), type(uint256).max);
+        seatJoin.take(_pid(SEAT, alice), type(uint256).max);
+        vm.stopPrank();
+        (,,,, uint128 bad) = ledger.ilkState(SEAT);
+        assertEq(bad, 0, "covered from the Treasury in the same transaction");
+        assertEq(ledger.totalBadDebt(), 0);
         _assertSupply();
         _assertUnits();
     }
@@ -1341,13 +1413,15 @@ contract SeatsTest is SeatSystem {
     /// forwards any calldata): approving `reward.approve` would let anyone make every account approve them. Refused at
     /// propose; a token-moving selector can still be REMOVED (rule 0), and an ordinary claim selector is still accepted.
     function test_panelG4_claimRuleRefusesTokenMovingSelectors() public {
-        bytes4[6] memory bad = [
+        bytes4[8] memory bad = [
             bytes4(0x095ea7b3), // approve
             0xa9059cbb, // transfer
             0x23b872dd, // transferFrom
             0xd505accf, // permit
             0xa22cb465, // setApprovalForAll
-            0x42842e0e // safeTransferFrom
+            0x42842e0e, // safeTransferFrom
+            0xd73dd623, // increaseApproval (audit wave 1)
+            0x87517c45 // Permit2 approve (audit wave 1)
         ];
         for (uint256 i; i < bad.length; ++i) {
             for (uint8 rule = 1; rule <= 2; ++rule) {

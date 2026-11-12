@@ -8,9 +8,10 @@ import {ParametersRules} from "./ParametersRules.sol";
 /// @dev What governance can and cannot do, which is the point of this contract:
 ///  - CAN: tune a type's risk values inside the bounds below; add a new type; set the v1 Migrator's cap;
 ///    set the bridge minter once; set the peg keeper minter once and its cap; set the savers' share of interest
-///    within 0-80%; open a fee-note series (tenor 30/90/180 days, discount <= 10%, a size cap); move a capped chain's
-///    `chainLine` within MAX_CHAIN_LINE (never uncap it). Freezing a type is `line = 0`. Lowering a type's line, the
-///    keeper cap or the unbacked brake is INSTANT by the governor (a brake needs no delay); raising waits 48h.
+///    within 0-50% (MAX_SAVINGS_SHARE), at most 10 points per change (MAX_SAVINGS_STEP); open a fee-note series
+///    (tenor 30/90/180 days, discount <= 10%, a size cap); move a capped chain's `chainLine` within MAX_CHAIN_LINE
+///    (never uncap it). Freezing a type is `line = 0`. The risk-reducing direction is INSTANT by the governor, also
+///    after the seal (the `lower*` acts, `postLowerDepth`, `removeDepthSampler`, `disableSleeveIlk`); raising waits 48h.
 ///  - CANNOT: change a type's token, custody (join) or price feeds once registered (v1's rule: a feed
 ///    that breaks is wound down, never re-pointed), seize collateral, or mint.
 /// Genesis types are registered by the deployer (`wirer`) before `seal()`, so a launch does not wait
@@ -177,7 +178,10 @@ contract Parameters is ParametersBase {
     }
 
     /// @notice Stop a sleeve's standing bid on a type at once (the safe direction; liquidations fall back to the
-    /// caller/auction path). ADD_SLEEVE_ILK lists it again.
+    /// caller/auction path). ADD_SLEEVE_ILK (48h) lists it again. On an EDGE type it also ends the type's first-loss cover
+    /// and its edge capacity reads 0, so while any edge debt exists every borrow and charged rate change on that type
+    /// reverts (`EdgeCapacityExceeded`) until the re-listing. A re-listing restarts the type's bootstrap allowance
+    /// (`listedAt`, `genesisLine`): edge capacity is bounded by vested imdUSD only as far as the Safe does not re-list.
     function disableSleeveIlk(bytes32 ilk, bool edge) external onlyGovernor {
         address sleeve = edge ? edgeBackstop : blueBackstop;
         if (sleeve == address(0)) revert BadConfig();
@@ -190,7 +194,10 @@ contract Parameters is ParametersBase {
         return edgeIlks.length;
     }
 
-    /// @notice Set a ceiling on a type with none, or lower one, at once (it only stops new borrowing; positions untouched).
+    /// @notice Set a ceiling on a type with none, or lower one, at once. Every adjust that is not a de-risking
+    /// repay-and-withdraw is measured at the borrow price min(low, cap), so a low cap also refuses plain collateral
+    /// withdrawals from an indebted position (repay first) until SET_CAP lifts it; repay, deposit, redemption and
+    /// liquidation are unaffected.
     /// Refused below 1/100 of the live low (a unit error, e.g. a per-token figure for an 8-decimal token).
     function lowerCap(bytes32 ilk, uint256 cap_) external onlyGovernor {
         if (!exists(ilk)) revert UnknownIlk();
@@ -201,9 +208,12 @@ contract Parameters is ParametersBase {
     }
 
 
-    /// @notice Lower the other chains' IMD lines at once (after the other chain lowered its line, or to be safe).
+    /// @notice Lower the other chains' IMD lines at once (after the other chain lowered its line). Refused while the depth
+    /// line binds this chain's depth-gated type (audit wave 1): less exposure counted elsewhere is more room here, so then it
+    /// would RAISE the enforced line without the timelock; SET_OTHER_IMD (48h) does that.
     function lowerOtherImdLines(uint256 lines) external onlyGovernor {
         if (depthIlk == bytes32(0) || lines >= otherImdLines) revert OutOfBounds();
+        if (depthLine() < _risk[depthIlk].line) revert OutOfBounds();
         _cancelPending(SET_OTHER_IMD, 0);
         otherImdLines = lines;
         emit OtherImdSet(lines, otherImdChop);
@@ -212,14 +222,16 @@ contract Parameters is ParametersBase {
 
     // ---------------------------------------------------------------- D1: instant lowering (governor, no delay)
 
-    /// @notice Lower the depth-gated type's line at once (lowering only stops new draws; positions are untouched).
+    /// @notice Lower the depth-gated type's line at once. It stops new draws and, because the line binds the cooldown
+    /// premium too, an in-cooldown rate change; repay, deposit, redemption and liquidation carry on.
     function lowerDepthLine(uint128 line) external onlyGovernor {
         if (depthIlk == bytes32(0)) revert OutOfBounds();
         _lowerLine(depthIlk, line);
     }
 
     /// @notice Lower ANY type's line at once (a type that has just booked bad debt must be stoppable without a
-    /// 48h wait). Strictly lowering; raising stays a SET_RISK proposal. Positions are untouched.
+    /// 48h wait). Strictly lowering; raising stays a SET_RISK proposal. It stops new draws and, because the line binds the
+    /// cooldown premium too, an in-cooldown rate change; repay, deposit, redemption and liquidation carry on.
     function lowerLine(bytes32 ilk, uint128 line) external onlyGovernor {
         if (!exists(ilk)) revert UnknownIlk();
         _lowerLine(ilk, line);
@@ -258,9 +270,13 @@ contract Parameters is ParametersBase {
         _flagDepth();
     }
 
-    /// @notice Post a LOWER depth ceiling at once (a higher one, or none, goes through SET_DEPTH and the timelock).
+    /// @notice Post a LOWER depth ceiling at once (a higher one, or none, goes through SET_DEPTH and the timelock). With no
+    /// ImdDepth the posted figure IS the depth, so 0 means zero, not "no ceiling" (audit wave 1).
     function postLowerDepth(uint256 depth) external onlyGovernor {
-        if (depthIlk == bytes32(0) || depth == 0 || (depthCap != 0 && depth >= depthCap)) revert OutOfBounds();
+        if (
+            depthIlk == bytes32(0) || depth == 0
+                || ((depthCap != 0 || address(imdDepth) == address(0)) && depth >= depthCap)
+        ) revert OutOfBounds();
         _cancelPending(SET_DEPTH, 0);
         depthCap = depth;
         emit DepthPosted(depth);
@@ -284,6 +300,9 @@ contract Parameters is ParametersBase {
     }
 
     function _touches(bytes memory p, uint8 kind, bytes32 ilk) private pure returns (bool) {
+        // Every per-type payload has a kind word and an ilk word; a shorter item names no type, and must never make an
+        // instant lower revert (audit wave 1: one malformed batch item blocked every type's brakes).
+        if (p.length < 64) return false;
         (uint8 k, bytes32 i) = abi.decode(p, (uint8, bytes32));
         if (k == BATCH) {
             (, bytes[] memory items) = abi.decode(p, (uint8, bytes[]));
@@ -304,7 +323,8 @@ contract Parameters is ParametersBase {
         _setGroup(ilk, group, line);
     }
 
-    /// @notice End genesis. From here on only the timelock changes anything.
+    /// @notice End genesis. From here on the wirer has no power; every change is the timelock's, except the governor's
+    /// instant risk-reducing acts (the `lower*` functions, `postLowerDepth`, `removeDepthSampler`, `disableSleeveIlk`).
     function seal() external {
         if (msg.sender != wirer) revert Unauthorized();
         if (sealed_) revert Sealed(); // one-shot: a second seal would restart every type's redemption fee at the cap

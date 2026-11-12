@@ -59,12 +59,13 @@ contract BridgeTest is TwoChains {
         _open();
         assertEq(rh.usd.bridge(), address(rh.bridge));
         assertEq(rh.bridge.peers(HOME_EID), _peer(home.bridge));
-        // the minter is set once
+        // the minter is set once: a second SET_BRIDGE is refused at propose (audit wave 1), and ImdUSD itself refuses one
         vm.prank(safe);
+        vm.expectRevert(ParametersBase.BadConfig.selector);
         rh.params.propose(abi.encode(uint8(4), address(rh.bridge)));
-        _warp(48 hours);
+        vm.prank(address(rh.params));
         vm.expectRevert(ImdUSD.AlreadySet.selector);
-        rh.params.applyPending();
+        rh.usd.setBridge(address(rh.bridge));
     }
 
     function test_pathBoundsAndBatch() public {

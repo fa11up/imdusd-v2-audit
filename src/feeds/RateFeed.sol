@@ -25,6 +25,10 @@ contract RateFeed is IFeed {
 
     uint192 public checkpointRate;
     uint64 public checkpointAt;
+    /// @notice The highest rate ever accepted (capped). A return to it is not new value, so the cap does not apply to it
+    /// (audit wave 1: a poke during a transient dip re-based the checkpoint there, and the honest return was then
+    /// rate-limited for months). A fall is still taken in full: `rate` is never above the live rate.
+    uint192 public highRate;
 
     error InvalidFeed();
     error RateUnavailable();
@@ -43,6 +47,7 @@ contract RateFeed is IFeed {
         if (!ok || r == 0) revert InvalidFeed();
         checkpointRate = uint192(r);
         checkpointAt = uint64(block.timestamp);
+        highRate = uint192(r);
     }
 
     /// @notice The exchange rate as the source reports it, uncapped.
@@ -53,12 +58,14 @@ contract RateFeed is IFeed {
         return (abi.decode(data, (uint256)), true);
     }
 
-    /// @notice min(live rate, checkpoint grown at the cap). Zero if the source stops answering.
+    /// @notice min(live rate, max(checkpoint grown at the cap, highest rate accepted)). Zero if the source stops answering.
     function rate() public view returns (uint256) {
         (uint256 live, bool ok) = liveRate();
         if (!ok) return 0;
         uint256 ck = checkpointRate;
         uint256 ceiling = ck + ck * maxGrowthPerSecond * (block.timestamp - checkpointAt) / 1e18;
+        uint256 high = highRate;
+        if (high > ceiling) ceiling = high;
         return live < ceiling ? live : ceiling;
     }
 
@@ -72,6 +79,7 @@ contract RateFeed is IFeed {
         if (r == 0) revert RateUnavailable();
         checkpointRate = uint192(r);
         checkpointAt = uint64(block.timestamp);
+        if (r > highRate) highRate = uint192(r);
         emit Poked(r);
     }
 

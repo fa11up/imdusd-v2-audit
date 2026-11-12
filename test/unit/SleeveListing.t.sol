@@ -117,6 +117,20 @@ contract SleeveListingTest is System {
         vm.stopPrank();
     }
 
+    /// Audit wave 1: a NEW type in a sleeve already listing MAX_ILKS would revert at apply (TooManyTokens) after holding the
+    /// slot 48 h; propose refuses it.
+    function test_auditW1_addSleeveIlkRefusesAFullSleeve() public {
+        // ParametersRules writes Backstop's limits out as constants (code size): they must stay equal.
+        assertEq(blue.MAX_TOKENS(), 6, "ParametersRules.SLEEVE_MAX_TOKENS");
+        assertEq(blue.MAX_ILKS(), 12, "ParametersRules.SLEEVE_MAX_ILKS");
+        uint8 k = params.ADD_SLEEVE_ILK();
+        assertEq(blue.ilkCount(), 1);
+        vm.mockCall(address(blue), abi.encodeWithSelector(Backstop.ilkCount.selector), abi.encode(blue.MAX_ILKS()));
+        vm.prank(governor);
+        vm.expectRevert(ParametersBase.OutOfBounds.selector);
+        params.propose(abi.encode(k, WBTC, false, uint128(0), uint128(2e8), uint128(0)));
+    }
+
     function test_disableSleeveIlkIsInstantAndGovernorOnly() public {
         vm.expectRevert(GovernedByKind.NotGovernor.selector);
         params.disableSleeveIlk(ETH, false);

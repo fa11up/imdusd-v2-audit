@@ -11,7 +11,8 @@ import {PegCollateral} from "../../src/earn/PegCollateral.sol";
 import {DeployTypes} from "../DeployConfig.sol";
 import {DeployBase} from "./DeployBase.sol";
 
-/// @notice Stage 5c: peg positions. On the PegLPVault deployed in 5b, before the seal: the collateral wrapper,
+/// @notice Peg positions, step 5c of stage 4 (called from StageGenesis). On the PegLPVault deployed in step 5b,
+/// before the seal: the collateral wrapper,
 /// the share feed, a Join for the wrapper, the type (genesis, no timelock) and the zap. Re-run safe: each piece is skipped once it exists.
 abstract contract StagePeg is DeployBase {
     function _stagePeg(DeployTypes.Config memory cfg, Deployed memory d) internal {
@@ -31,7 +32,9 @@ abstract contract StagePeg is DeployBase {
             d.pegCollateral = new PegCollateral(IERC20(address(d.pegLP)), d.params.wirer());
             _rec("PegCollateral", g, type(PegCollateral).creationCode.length + 64);
         }
-        if (!(_has(address(d.pegFeed)) && _ok(address(d.pegFeed.vault()) == address(d.pegLP), "PegShareFeed"))) {
+        if (!(_has(address(d.pegFeed)) && _ok(address(d.pegFeed.vault()) == address(d.pegLP) && d.pegFeed.stable() == address(d.usd)
+                    && d.pegFeed.quoteAggregator() == cfg.pegQuoteFeed && d.pegFeed.quoteStaleAfter() == cfg.pegQuoteFeedMaxAge
+                    && !d.pegFeed.twoSidedOnly(), "PegShareFeed"))) {
             g = gasleft();
             d.pegFeed = new PegShareFeed(
                 IPegVaultRead(address(d.pegLP)), address(d.usd), cfg.pegQuoteFeed, cfg.pegQuoteFeedMaxAge, false

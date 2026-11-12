@@ -65,7 +65,11 @@ abstract contract StageCore is DeployBase {
             d.ledger = new Ledger(d.usd, d.params, d.pricer, address(d.treasury), me, IPulse(address(d.pulse)), nft_);
             _rec("Ledger (+SortedPositions, LedgerSettlement)", g, type(Ledger).creationCode.length + 192);
         }
-        if (d.ledger.nft().ledger() == address(0)) d.ledger.nft().bind(address(d.ledger));
+        if (d.ledger.nft().ledger() == address(0)) {
+            g = gasleft();
+            d.ledger.nft().bind(address(d.ledger));
+            _rec("positionNFT.bind", g, CALL_DATA); // in the gas log like every other broadcast (audit wave 1)
+        }
         if (!(_has(address(d.redeemer)) && _ok(d.redeemer.ledger() == d.ledger, "Redeemer"))) {
             g = gasleft();
             d.redeemer = new Redeemer(d.ledger);

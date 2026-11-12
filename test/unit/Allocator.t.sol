@@ -7,7 +7,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {MockERC20, MockFeed} from "../utils/Mocks.sol";
-import {Allocator, ISwapRoute, IBackstopSale} from "../../src/peg/Allocator.sol";
+import {Allocator, ISwapRoute, IBackstopSale, IBackstopPriceAlloc} from "../../src/peg/Allocator.sol";
 import {GovernedByKind as Governed} from "../../src/GovernedByKind.sol";
 
 contract MockVault4626 is ERC4626 {
@@ -18,6 +18,15 @@ contract MockVault4626 is ERC4626 {
 contract MockPegBuffer {
     address public quote;
     uint256 public buffer;
+    uint256 public target = 1_000_000e6;
+
+    function setTarget(uint256 t) external {
+        target = t;
+    }
+
+    function bufferRoom() external view returns (uint256) {
+        return target > buffer ? target - buffer : 0;
+    }
 
     constructor(address q) {
         quote = q;
@@ -48,6 +57,11 @@ contract MockLPVault is ERC20 {
 
     function setTicks(int24 spot, int24 twap) external {
         (spotTicks, twapTicks) = (spot, twap);
+    }
+
+    function previewDeposit(uint256 shares) external view returns (uint256, uint256) {
+        if (totalSupply() == 0) return (0, 0);
+        return (shares, shares / 1e12);
     }
 
     function deposit(uint256 shares, uint256 max0, uint256 max1, address to) external returns (uint256, uint256, uint256) {
@@ -94,14 +108,44 @@ contract MockRoute is ISwapRoute {
     }
 }
 
+/// @dev The Backstop's price source: (low, high, ok) per token, USD per 1e18 raw.
+contract MockBackstopOracle is IBackstopPriceAlloc {
+    mapping(address => uint256) public low;
+    mapping(address => uint256) public high;
+    mapping(address => bool) public bad;
+    mapping(address => uint256) public payoutOf;
+
+    function set(address t, uint256 l, uint256 h, bool isBad) external {
+        (low[t], high[t], bad[t]) = (l, h, isBad);
+    }
+
+    function setPayout(address t, uint256 p) external {
+        payoutOf[t] = p;
+    }
+
+    function priceOf(address t) external view returns (uint256, uint256, bool) {
+        return (low[t], high[t], !bad[t] && low[t] != 0);
+    }
+}
+
 contract MockBackstop is IBackstopSale {
     address public allocator;
     IERC20 public imdUSD;
+    MockBackstopOracle public prices = new MockBackstopOracle();
     uint256 public sold;
     uint256 public proceedsBooked;
 
     function setAllocator(address a) external {
         allocator = a;
+    }
+
+    function oracle() external view returns (IBackstopPriceAlloc) {
+        return prices;
+    }
+
+    /// @dev Backstop.coll: what the sleeve holds of `t` (the mock holds its collateral as a plain balance).
+    function coll(address t) external view returns (uint256) {
+        return IERC20(t).balanceOf(address(this));
     }
 
     function setImdUSD(IERC20 t) external {
@@ -116,6 +160,8 @@ contract MockBackstop is IBackstopSale {
         Allocator(msg.sender).onBackstopSell(token, amount, data);
         got = imdUSD.balanceOf(address(this)) - before;
         require(got >= minOut, "short");
+        (uint256 low,,) = prices.priceOf(token);
+        require(got >= amount * low / 1e18 * 9_800 / 10_000, "floor"); // Backstop.MAX_SALE_SLIPPAGE_BPS
         sold += amount;
         proceedsBooked += got;
     }
@@ -160,6 +206,7 @@ contract AllocatorTest is Test {
         al = new Allocator(governor, treasury, freezer, 100); // 1% max slippage
         backstop.setAllocator(address(al));
         backstop.setImdUSD(IERC20(address(usd)));
+        backstop.prices().set(address(weth), 2000e18, 0, false);
         (VD, SW, K_LIMIT, K_SLIP) = (al.VAULT_DEPOSIT(), al.SWAP(), al.SET_LIMIT(), al.SET_SLIPPAGE());
 
         _gov(abi.encode(al.ADD_KEEPER(), keeper));

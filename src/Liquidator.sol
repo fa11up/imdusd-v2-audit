@@ -134,7 +134,7 @@ contract Liquidator is TransientReentrancyGuard {
 
     /// @notice `bite`, reverting on the caller path if the position would give up less collateral than `minSeized`. A price
     /// update landing ahead of a caller lifts the price he pays. Keepers and the site always use this form, by private send. A
-    /// standing bid does not read it: the caller pays nothing there.
+    /// standing bid does not read it: the caller pays nothing there (and earns only the chip, if it is also the marker).
     function bite(uint256 id, uint256 minSeized) public nonReentrant returns (uint256 repaid, uint256 seized, uint256 bad) {
         Mark memory m = marks[id];
         if (m.at == 0) revert NotMarked();
@@ -158,8 +158,9 @@ contract Liquidator is TransientReentrancyGuard {
         }
         // STANDING BID: a sleeve that covers the type and can pay what this liquidation repays buys the
         // collateral now, at the same price a caller would; the penalty (less the Treasury's cut and the marker's chip) is
-        // the sleeve's. Otherwise the caller pays, as before. The caller earns nothing here: the marker's chip is the kick.
-        // Only while the type's legs agree. Apart past `skew`, `low` is the (possibly lagging) median, and a
+        // the sleeve's. Otherwise the caller pays, as before. The kick is the marker's chip: a `bite` caller who did not mark
+        // earns nothing, but `liquidate` on a type with no grace (every beta type) marks first, so its caller IS the marker.
+        // only while the type's legs agree. Apart past `skew`, `low` is the (possibly lagging) median, and a
         // forced bid there would overpay; a caller may still choose to pay it.
         address sleeve = params.edgeIlk(ilk) ? params.edgeBackstop() : params.blueBackstop();
         if (sleeve != address(0) && q.agree) {
@@ -197,8 +198,9 @@ contract Liquidator is TransientReentrancyGuard {
 
     /// @notice An auction type's join closes the position it has just sold, at the price the taker paid
     /// (per 1e18 units, in imdUSD). The join is the payer: the Ledger burns the debt from what the taker
-    /// paid into it, or, with `reserve` (a sale paid in a reserve asset sent to the Treasury, e.g. the stock types' USDG auction),
-    /// books it as reserve-backed supply instead of burning.
+    /// paid into it, or, with `reserve` (a sale paid in a reserve asset sent to the Treasury, the USDG auction),
+    /// books it as reserve-backed supply instead of burning. Bad debt the sale leaves is covered in the same transaction, as
+    /// `bite` does (audit wave 1: it was left booked for anyone to cover later).
     function settle(uint256 id, uint256 price, address marker, bool reserve)
         external
         nonReentrant
@@ -209,7 +211,8 @@ contract Liquidator is TransientReentrancyGuard {
         if (!c.auction || msg.sender != c.join) revert Unauthorized();
         if (_poke()) revert SequencerGrace();
         _requireUnhealthy(ilk, id);
-        return ledger.liquidatePosition(id, price, msg.sender, marker, reserve);
+        (repaid, seized, bad) = ledger.liquidatePosition(id, price, msg.sender, marker, reserve);
+        _cover(ilk, bad);
     }
 
     /// @notice Mark and bite in one call, for types with no grace (or once a grace has already run).

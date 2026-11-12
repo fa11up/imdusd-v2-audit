@@ -16,8 +16,8 @@ import {IFeed} from "../interfaces/IFeed.sol";
 
 /// @title DepthSampler
 /// @notice The market depth of one Uniswap v4 pool, measured ON CHAIN from the pool's own liquidity, kept as hourly
-/// buckets, and read as the minimum over the last day. It replaces the Safe POSTING the depth that the k-rule multiplies
-/// (Parameters D1, the depth rule): nobody posts it, anyone samples it.
+/// buckets, and read as a robust low: the `ROBUST_RANK`-th lowest bucket of the last `WINDOW_HOURS` hours. It replaces the Safe POSTING the depth that the k-rule multiplies
+/// (the depth rule): nobody posts it, anyone samples it.
 ///
 /// WHAT IS MEASURED. For each token, the USD value of the OTHER token the pool would pay out while that token is sold
 /// until its pool price has fallen `bandBps` below the REFERENCE price: `sellDepth0` (token0 sold, token1 paid out, the
@@ -31,14 +31,25 @@ import {IFeed} from "../interfaces/IFeed.sol";
 /// not change the reading: only positions do. A sample is refused (reverts, nothing recorded) when the pool's tick is
 /// more than `maxDeviationTicks` from the reference tick (stale feed, or a pool far from where the protocol prices the
 /// collateral: depth around the reference would not be what a liquidator faces), or when either feed is stale.
-/// THE PREMISE HOLDS ONLY IF THE FEEDS CANNOT BE MOVED INSIDE THE SAMPLER'S TRANSACTION: a feed
-/// that reads this pool's (or any pool's) live price makes the reference move with the push, and one push-sample-poke
-/// transaction then deflates the reading. Wire attested/Chainlink feeds (for IMD: the attested IMD median x Chainlink
-/// ETH/USD), never a LivePoolPrice.
+/// THE PREMISE HOLDS ONLY WHILE THE FEEDS CANNOT BE MOVED AROUND A SAMPLE: a feed that reads a
+/// pool's live price (LivePoolPrice) moves the reference with a push of that pool, so a pushed sample is deflated. An
+/// attested/Chainlink reference (for IMD: the attested IMD median x Chainlink ETH/USD) is the stronger choice when it can
+/// be kept fresh; a stale feed refuses the sample, so a reference that goes stale reads as zero depth. The beta wires the
+/// LIVE reference (DeployConfig `_depthSamplers`): its attested IMD leg has a 1 h max age. With that wiring a push
+/// moves the reference with the pool, so `maxDeviationTicks` never fires for a sampler whose reference is its own pool
+/// (the beta's sampler 0, on pool 0xb07d; samplers 1 and 2 are measured against 0xb07d's price, so a push of 0xb07d makes
+/// them refuse PoolOffReference instead), and a pushed sample reads the thinner liquidity around the pushed price.
+/// THE PUSH NEEDS NO CAPITAL HELD (audit wave 1, finding 3-oracles-depth): push the pool and settle, call `sample()`
+/// with the PoolManager locked again, push back and settle, all in one transaction (or as three transactions of one
+/// builder bundle). The cost is the pool fee both ways plus gas, about 2% of the pushed notional: about $200 per hour
+/// for a 25% push at the beta's depth, and four such hours lower the sIMD line for about 8 days. It can only LOWER the
+/// reading. No rule built from the samplers' own reads can stop it (sampling is permissionless, so a remembered price
+/// can be walked by the same calls, and a bundle is as atomic as a transaction): the fixes are a reference a push cannot
+/// move (an attested leg) or a proven end-of-previous-block pool price. Accepted for the beta.
 ///
-/// NOT WHILE THE POOLMANAGER IS UNLOCKED. `sample()` reverts inside any v4 unlock callback: v4's flash
-/// accounting lets a caller push the price (or pull liquidity) and settle afterwards with no capital, which is the
-/// zero-capital form of a deflating sample. A push now needs real capital held across separate transactions.
+/// NOT WHILE THE POOLMANAGER IS UNLOCKED. `sample()` reverts inside any v4 unlock callback, so a sample
+/// cannot be taken in the middle of a flash-accounted push. This does NOT stop the push above: v4 clears the unlock
+/// flag when `unlock()` returns, so a sample between two unlocks of one transaction is accepted.
 ///
 /// WHY HOURLY BUCKETS OF MINIMA, AND WHY ANYONE MAY SAMPLE AT ANY TIME. Liquidity can be added for one block (JIT) and
 /// removed in the next, so one read proves nothing. Each UTC hour has a bucket that keeps the MINIMUM of every sample
@@ -50,6 +61,12 @@ import {IFeed} from "../interfaces/IFeed.sol";
 /// figure he must keep the liquidity in the pool whenever anyone may sample, all day: and liquidity held all day IS
 /// depth (anyone may trade against it). (A rule of "at most one sample per hour" would let the attacker take each
 /// hour's only slot with JIT liquidity: that is why this contract has none.)
+/// THIS REQUIRES THE KEEPER'S SAMPLE TO BE SENT PRIVATELY (audit wave 1, panel 3). A sample in the public mempool can be
+/// sandwiched (+L before it, -L after it, one bundle), and nothing here can tell one-block liquidity from liquidity held
+/// all day (v4 keeps no position age; a later-block confirmation is just as public). The keeper sends only through
+/// private relays, so the block of its
+/// sample is unknown. Left: a builder that front-runs a private transaction it includes, bounded by `MAX_RISE`, the
+/// posted ceiling (Parameters.depthCap) and the Safe's instant `postLowerDepth`.
 ///
 /// RISES ARE CAPPED. A new sample may not record more than `MAX_RISE` x the current `depth()` (when it is non-zero).
 /// The window minimum already makes any rise wait a full day; the cap bounds it to doubling per day even if the old

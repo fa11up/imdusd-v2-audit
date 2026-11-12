@@ -617,14 +617,11 @@ abstract contract PegHookTest is PegSystem {
     // ------------------------------------------------------------ governance
 
     function test_keeperMinterSetOnceThroughTimelock() public {
+        // Audit wave 1: a second keeper could never apply (AlreadySet), so propose refuses it instead of holding the slot 48 h.
         bytes memory pk = abi.encode(params.SET_KEEPER(), address(hook));
         vm.prank(governor);
+        vm.expectRevert(ParametersBase.BadConfig.selector);
         params.propose(pk);
-        vm.warp(vm.getBlockTimestamp() + 48 hours);
-        vm.expectRevert(ImdUSD.AlreadySet.selector);
-        params.applyPending();
-        vm.prank(governor);
-        params.cancel();
         vm.expectRevert(ImdUSD.Unauthorized.selector);
         usd.setKeeper(address(this));
         bytes memory big = abi.encode(params.SET_KEEPER_CAP(), params.MAX_KEEPER_CAP() + 1);

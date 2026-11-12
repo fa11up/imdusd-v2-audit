@@ -167,8 +167,9 @@ contract SeatAccount {
 
     // ---------------------------------------------------------------- ERC-8004 (hive-seat-vault :216)
 
-    /// @notice Register the seat's agent through the adapter, once; a seat registered before it was pledged
-    /// needs nothing.
+    /// @notice Register the seat's agent through the adapter, once per account: `agentId` is never cleared when the seat
+    /// is released or changes holder, so a later holder cannot register again (the earlier holder's URI stays bound). A
+    /// seat registered before it was pledged needs nothing.
     function registerAgent(string calldata agentURI) external onlyHolder returns (uint256 id) {
         if (agentId != 0) revert AlreadyRegistered();
         if (nft.ownerOf(tokenId) != address(this)) revert NotHeld();
@@ -199,6 +200,8 @@ contract SeatAccount {
     /// a seat's custody never walks the tokens reported, so reporting a worthless or hostile token costs
     /// its reporter gas and nobody else anything.
     function sync(address token) public {
+        // Audit wave 1: the seat itself (balanceOf shares the ERC-20 selector) and the join are never rewards.
+        if (token == address(nft) || token == join) revert WrongToken();
         uint256 bal = IERC20(token).balanceOf(address(this));
         uint256 seen = reported[token];
         if (bal <= seen) return;

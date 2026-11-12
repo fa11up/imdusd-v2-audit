@@ -15,7 +15,7 @@ interface ISeatFigure {
 ///
 ///     value  = min(median, spot) x factor,   factor = liquidity x trend
 ///     liquidity = min(1, sales7d / 100)       -- fewer sales, lower LTV
-///     trend     = min(1, median / median30dAgo) -- a falling 30-day trend tightens 1:1, a rise never loosens
+///     trend     = min(1, median / median30dAgo) -- a falling 30-day trend tightens 1:1; trend never exceeds 1
 ///
 /// Folding the factor into the price is the same inequality as scaling `mat` (collateral x price x factor
 /// >= debt x mat), and it needs no change to the Pricer or the Ledger. The skew check is unaffected: both
@@ -28,7 +28,7 @@ interface ISeatFigure {
 ///    never come from two different windows. The median leaf keeps it (`latestFigure`). (Beta seats,
 ///    2026-10-26: this replaced a separate count feed, one fewer question per refresh.)
 ///  - `median30dAgo` is a 32-slot daily ring kept HERE by permissionless `poke`. The slot for a day holds
-///    the raw USD median first poked that day; `median30dAgo` is the newest slot at least 30 days old. With
+///    the fall-capped USD median (`medianUsd`) first poked that day; `median30dAgo` is the newest slot at least 30 days old. With
 ///    less than 30 days of history the oldest slot stands in (a rising market then reads trend = 1, a
 ///    falling one tightens: conservative). An empty ring is trend = 1.
 ///
@@ -36,21 +36,28 @@ interface ISeatFigure {
 /// leg reads may fall at most `MAX_FALL_PER_UPDATE_BPS` (20%) below the previously ACCEPTED median per new
 /// attestation. A lower attestation reads `previous x 0.8`, and that becomes the accepted value the next
 /// attestation steps from: a real 40% crash lands at 0.8, then 0.64, then 0.6. No time-based wait. Rises
-/// pass through uncapped (the trend term already keeps a rise from loosening the LTV). Only the median leg:
+/// pass through uncapped here: a median rise raises the value 1:1 (trend only keeps factor <= 1), bounded only by
+/// the median leaf's own epoch cap, and the later fall back is throttled to 20% per attestation. Only the median leg:
 /// the spot leg is hardened in the recipe, and the Pricer collapses to the median when the legs diverge.
+/// The cap bounds the accepted wei median, not the value: `trend` is computed in USD and is not under it, so a capped
+/// 20% median step can show as a larger value step (0.8 x 0.8 = 36% at once), and an ETH/USD move enters both through
+/// `ethUsd` and through `trend`.
+/// The FIGURE (sales7d, which scales both legs through `liquidity`) steps by the same rule, at most 20% down and
+/// 25% (+1 seat) up per new attestation (audit wave 1, panel 6): a rise in it loosens the LTV, so it is capped both ways.
 ///
 /// "New attestation" = a strictly newer `updatedAt` on the median feed. SwarmFeed refuses an attestation
 /// older than its current one but admits one with an EQUAL `issuedAt`; such a replacement is NOT a new
 /// update: it is capped against the same base as the attestation it replaced, so re-submitting, re-reading
 /// or re-poking never steps the value down further.
 ///
-/// The cap state is recorded lazily by permissionless `poke` (no keeper needed for correctness): every
-/// view computes the accepted value from the recorded state and the feed's live reading, so the Pricer
-/// never reads a stale cap. The state holds the last RECORDED attestation (`raw`, `at`) and the accepted
-/// value before it (`base`); the live reading is one step from it. The only thing a missing poke changes:
-/// two attestations landing with no poke between them count as ONE step (the first is no longer readable),
-/// so an unpoked fall is capped harder (the leg falls slower), never looser. Anyone who wants a fall
-/// recognised (a liquidator, the relayer) pokes after each attestation.
+/// The cap state is recorded lazily by permissionless `poke`: every view computes the accepted value from
+/// the recorded state and the feed's live reading, so the Pricer never reads a stale cap. The state holds
+/// the last RECORDED attestation (`raw`, `at`) and the accepted value before it (`base`); the live reading
+/// is one step from it. Two attestations landing with no poke between them count as ONE step (the first is
+/// no longer readable), so an unpoked fall is capped harder (the leg falls slower), never looser. Anyone who
+/// wants a fall recognised (a liquidator, the relayer) pokes after each attestation. One poke IS needed: with
+/// nothing recorded (a fresh leaf, the beta deploy) the type prices at 0 until a poke records the first
+/// attestation (audit wave 1: before, every attestation ahead of the first poke was accepted raw).
 contract SeatFeed is IFeed {
     struct Point {
         uint192 value;
@@ -63,13 +70,20 @@ contract SeatFeed is IFeed {
     uint256 public constant FULL_LIQUIDITY = 100;
     /// @notice Largest fall of the accepted median per new attestation, in basis points. Constant by design.
     uint256 public constant MAX_FALL_PER_UPDATE_BPS = 2000;
+    /// @notice Largest rise of the accepted figure (distinct seats sold) per new attestation, in basis points, plus one
+    /// seat so a small count can grow. A rise loosens the LTV, so unlike the median it is capped too (audit wave 1, panel 6).
+    uint256 public constant MAX_FIGURE_RISE_BPS = 2500;
 
-    /// @notice The last recorded median attestation: its raw wei value, its `updatedAt`, and the accepted
-    /// value before it (the base it is capped against). 0 = nothing recorded: the next reading is accepted raw.
+    /// @notice The last recorded median attestation: its raw wei value and figure, its `updatedAt`, and the accepted
+    /// value and figure before it (the bases they are capped against). `at` 0 = nothing recorded: the type prices at 0
+    /// until a `poke` records the first attestation (audit wave 1: otherwise every attestation before the first poke
+    /// was accepted raw).
     struct Cap {
         uint128 base;
         uint128 raw;
         uint64 at;
+        uint32 figureBase;
+        uint32 figureRaw;
     }
 
     IFeed public immutable median; // attested 7-day p25, wei per seat; its figure = distinct seats sold
@@ -94,10 +108,13 @@ contract SeatFeed is IFeed {
         spot = spot_;
         ethUsd = ethUsd_;
         // Anchor the cap on the attestation live at deployment, so the first update after it is capped too. An empty
-        // median (a fresh leaf, the beta deploy) records nothing: the first attestation relayed is accepted raw, and
-        // the deployment relays and checks it; until both legs hold a value the type prices at 0.
+        // median (a fresh leaf, the beta deploy) records nothing: the type prices at 0 until the first attestation is
+        // relayed AND poked (the keeper pokes after every relay), which records it raw (an operator duty).
         (uint256 m, uint64 t) = median_.latestValue();
-        if (m != 0) cap = Cap({base: uint128(m), raw: uint128(m), at: t});
+        if (m != 0) {
+            uint32 f = _figureNow();
+            cap = Cap({base: uint128(m), raw: uint128(m), at: t, figureBase: f, figureRaw: f});
+        }
     }
 
     // ---------------------------------------------------------------- raw legs
@@ -115,9 +132,32 @@ contract SeatFeed is IFeed {
     /// before it. Always current (computed from the recorded state and the live reading; no poke needed).
     function acceptedMedian() public view returns (uint256) {
         (uint256 m, uint64 t) = median.latestValue();
-        if (m == 0) return 0;
         Cap memory c = cap;
+        if (m == 0 || c.at == 0) return 0;
         return t > c.at ? _capped(m, _capped(c.raw, c.base)) : _capped(m, c.base);
+    }
+
+    /// @notice The accepted figure (distinct seats sold): the live attestation's, moved at most 20% down or 25% (+1) up
+    /// from the accepted figure before it, by the same new-attestation rule as the median (audit wave 1, panel 6: the
+    /// liquidity term read the signed figure raw, so one attestation could cut both priced legs 90%).
+    function acceptedFigure() public view returns (uint256) {
+        (, uint64 t) = median.latestValue();
+        Cap memory c = cap;
+        if (c.at == 0) return 0;
+        uint256 f = _figureNow();
+        return t > c.at ? _cappedFigure(f, _cappedFigure(c.figureRaw, c.figureBase)) : _cappedFigure(f, c.figureBase);
+    }
+
+    function _figureNow() private view returns (uint32) {
+        uint256 f = ISeatFigure(address(median)).latestFigure();
+        return f > type(uint32).max ? type(uint32).max : uint32(f);
+    }
+
+    /// @dev `raw` kept within [base x (1 - 20%), base x (1 + 25%) + 1].
+    function _cappedFigure(uint256 raw, uint256 base) private pure returns (uint32) {
+        uint256 lowest = base * (10_000 - MAX_FALL_PER_UPDATE_BPS) / 10_000;
+        uint256 highest = base * (10_000 + MAX_FIGURE_RISE_BPS) / 10_000 + 1;
+        return uint32(raw < lowest ? lowest : raw > highest ? highest : raw);
     }
 
     /// @notice USD per seat from the accepted (fall-capped) median, no reflexive terms. The auction's opening
@@ -138,14 +178,22 @@ contract SeatFeed is IFeed {
     function _record() private {
         (uint256 m, uint64 t) = median.latestValue();
         if (m == 0) return;
+        uint32 f = _figureNow();
         Cap memory c = cap;
-        if (t > c.at) {
-            c.base = uint128(_capped(c.raw, c.base));
+        if (c.at == 0) {
+            // The first attestation recorded is accepted raw (value and figure).
+            c.base = uint128(m);
+            c.figureBase = f;
             c.at = t;
-        } else if (t < c.at || m == c.raw) {
+        } else if (t > c.at) {
+            c.base = uint128(_capped(c.raw, c.base));
+            c.figureBase = _cappedFigure(c.figureRaw, c.figureBase);
+            c.at = t;
+        } else if (t < c.at || (m == c.raw && f == c.figureRaw)) {
             return;
         }
         c.raw = uint128(m);
+        c.figureRaw = f;
         cap = c;
         emit MedianRecorded(m, t, c.base);
     }
@@ -163,10 +211,9 @@ contract SeatFeed is IFeed {
 
     // ---------------------------------------------------------------- reflexive terms
 
-    /// @notice min(1, sales7d / 100), sales7d = the distinct seats sold in the median's window.
+    /// @notice min(1, sales7d / 100), sales7d = the distinct seats sold in the median's window (the accepted figure).
     function liquidity() public view returns (uint256) {
-        uint256 n = ISeatFigure(address(median)).latestFigure();
-        return Math.min(1e18, Math.mulDiv(n, 1e18, FULL_LIQUIDITY));
+        return Math.min(1e18, Math.mulDiv(acceptedFigure(), 1e18, FULL_LIQUIDITY));
     }
 
     function median30dAgo() public view returns (uint256) {

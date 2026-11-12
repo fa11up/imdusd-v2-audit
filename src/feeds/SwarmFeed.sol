@@ -60,7 +60,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// but the buyer chooses the window, and the recipe samples fixed blocks inside it, so a buyer who pushes
 /// the pool at those blocks has a manipulated value attested honestly. Bounding the stale step alone was
 /// then shown insufficient: measured against the LAST value, six attestations relayed in one block walked a
-/// 20% cap from 1.0 to 3.48 (test/SwarmFeed.t.sol, `test_chainedAttestationsCannotWalkPastTheEpochBound`).
+/// 20% cap from 1.0 to 3.48 (measured in v1's suite, `test_chainedAttestationsCannotWalkPastTheEpochBound`).
 /// Measured against the anchor, an hour moves the price by at most the allowance however many attestations
 /// are bought; with the stale base earned only by a whole hour of silence past the lifetime, a run of
 /// steps compounds at no more than the cap per hour after the first: from a fresh feed 2x is four steps
@@ -154,8 +154,9 @@ abstract contract SwarmFeed is IFeed {
     /// lifetime before an epoch opens on the stale base; the one-day NHI feed earns it an hour after its lifetime
     /// too, so a gap in the index is followed within hours rather than days (review of cc4103f, 2026-10-07).
     uint256 public constant STALE_GROWTH_PERIOD = 1 hours;
-    /// @notice The allowance never exceeds this (2 x 10,000 bps at the widest cap); it also keeps the packed
-    /// uint24 exact.
+    /// @notice The widest allowance the epoch rule can give: STALE_DEVIATION_MULTIPLE x the widest cap the constructor
+    /// admits (10,000 bps). Not checked itself: that construction bound is what keeps the allowance under it and the
+    /// packed uint24 exact.
     uint256 public constant MAX_ALLOWANCE_BPS = 20_000;
 
     bytes32 public constant ATTESTATION_TYPEHASH = keccak256(
@@ -180,7 +181,7 @@ abstract contract SwarmFeed is IFeed {
     bool private _hasValue;
     /// @dev The bounding epoch: when it opened and the move it allows (bps), packed into the slot above
     /// so that opening one costs a single new storage write (the anchor value below) and the Intake's
-    /// 200,000-gas callback stipend still fits a first delivery (test/OracleAskerBoundGas.t.sol). An
+    /// 200,000-gas callback stipend still fits a first delivery (measured in v1, OracleAskerBoundGas). An
     /// epoch lasts maxAge from its first acceptance; the next acceptance after that opens a new one
     /// from the value then current. See `_epoch`.
     uint40 private _anchorAt;
@@ -248,13 +249,13 @@ abstract contract SwarmFeed is IFeed {
         // answered over one block or over a month.
         //
         // WHAT THIS CHECK DOES NOT DO, stated because a stronger claim here would be false: it
-        // requires a NONZERO relayer, and `SwarmRelay` is a nonzero relayer that admits EVERYONE.
-        // That pairing — no pinned question, `ATTESTATION_RELAYER` as the relayer — therefore passes
-        // construction and is exactly the configuration the HIGH finding describes;
-        // v1's PermissionlessRelay test still reproduces it against a leaf built that way.
-        // Nothing this repository SHIPS is in that state: PriceFeed, NhiFeed, SpotFeed and
-        // SwarmWorkOracle all override `questionPolicy` with a generated prefix, so all four take the
-        // bound branch and the relayer is not load-bearing for any of them. The hole is a footgun for
+        // requires a NONZERO relayer, and a relay contract that forwards for EVERYONE (v1's SwarmRelay)
+        // is nonzero. That pairing (no pinned question, a permissionless relay) therefore passes
+        // construction and is exactly the configuration the HIGH finding describes (v1's
+        // PermissionlessRelay test reproduced it). Nothing this repository SHIPS is in that state: every
+        // leaf in SwarmFeeds.sol (SwarmPriceFeed, SwarmSpotFeed, SwarmNhiFeed, SwarmSeatMedianFeed,
+        // SwarmSeatSpotFeed, SwarmImdDepthFeed) overrides `questionPolicy` with a frozen prefix, so all
+        // take the bound branch, and all are built with relayer zero (anyone relays). The hole is a footgun for
         // a FUTURE leaf that forgets the override, and closing it in the constructor needs a sound
         // on-chain test for "a relayer that restricts its callers", which `code.length` is not — a
         // relay contract may perfectly well carry an allowlist. Until such a test exists, the rule is
@@ -279,12 +280,19 @@ abstract contract SwarmFeed is IFeed {
         return (_value, _updatedAt);
     }
 
+    /// @notice When the live value was relayed (block time), as opposed to `latestValue`'s signature time. A consumer that
+    /// reconstructs how long the chain held a price (the seat auction's clock) starts the window here.
+    function acceptedAt() external view returns (uint64) {
+        return _acceptedAt;
+    }
+
     function isStale() external view override returns (bool) {
         return !_hasValue || _tooOld(_updatedAt);
     }
 
     /// @notice How many members must have given the signed answer for this feed to take it. MIN_AGREED here;
-    /// the price and spot feeds, whose answers are deterministic chain reads, demand two thirds of the panel.
+    /// the price and spot feeds, whose answers are deterministic chain reads, demand two thirds of the panel (67). The
+    /// NHI, seat and depth leaves keep 51; the depth leaf is also a deterministic read, but it can only lower depth.
     function minAgreed() public pure virtual returns (uint16) {
         return MIN_AGREED;
     }
@@ -297,9 +305,9 @@ abstract contract SwarmFeed is IFeed {
     /// The deviation guard bounds every value after the first against the current epoch's anchor, fresh
     /// or stale (`_checkValue`); a feed that pins its question document (questionPolicy, every shipped
     /// feed) verifies the question directly. The relayer is not a trust boundary on the shipped feeds:
-    /// it is SwarmRelay, which forwards for anyone. Nothing on chain bounds the FIRST value, which is why
-    /// the deployment buys and relays it, and DeployMainnet.verifySeeded checks it against the pool
-    /// before the operator deploys the vault (from a salt no one else knows, so no one else can deploy it first).
+    /// they are built with relayer zero, so anyone relays. Nothing on chain bounds the FIRST value: the
+    /// shipped feeds are deployed empty and whoever relays first sets it, so the operator's procedure, not
+    /// this code, must win (or check) the first relay of every leaf.
     /// Payload chainId and answerType must match the configured policy. Zero values revert.
     /// THE VALUE IS THE SIGNED `answer` (32 bytes, a uint256), not `figure`: the plane stopped filling `figure` for
     /// panel-evidence answers (mainnet NHI request d0203e1a, 2026-10-11: answer 0.98699e18, figure 0), and both
@@ -351,7 +359,7 @@ abstract contract SwarmFeed is IFeed {
         if (value == 0) return "0";
         // Word-sized counters (gas review 2026-10-05): the input stays uint64 and every output byte is
         // identical, but the loop skips narrow-integer cleanup — about 5,100 gas per bound attestation,
-        // which also widens the OracleAsker callback's headroom under the Intake's 200,000-gas stipend.
+        // which also widened v1's OracleAsker callback headroom under the Intake's 200,000-gas stipend.
         uint256 digits;
         for (uint256 v = value; v != 0; v /= 10) ++digits;
         bytes memory out = new bytes(digits);
@@ -423,10 +431,16 @@ abstract contract SwarmFeed is IFeed {
         return uint256(clockBlock) + elapsed * (CLOCK_DRIFT_DIVISOR - 1) / (12 * CLOCK_DRIFT_DIVISOR);
     }
 
-    /// @dev Refuse a window older than one lifetime against the time clock, then move the clock forward.
+    /// @dev Refuse a window older than one lifetime against the time clock, or one ending past the most blocks the data
+    /// chain can have made since the clock (one per 12 s, plus PARENT_SLACK; audit wave 1: a validly signed future-dated
+    /// window moved the clock ahead and every honest window after it was refused as behind), then move the clock forward.
     function _tickClock(uint64 toBlock, uint64 issuedAt) private {
         uint256 projected = projectedHead(issuedAt);
-        if (clockAt != 0 && uint256(toBlock) + maxAge / 12 < projected) revert WindowBehindClock(toBlock, projected);
+        if (clockAt != 0) {
+            if (uint256(toBlock) + maxAge / 12 < projected) revert WindowBehindClock(toBlock, projected);
+            uint256 most = uint256(clockBlock) + (issuedAt > clockAt ? issuedAt - clockAt : 0) / 12 + PARENT_SLACK;
+            if (toBlock > most) revert WindowInFuture(toBlock, most);
+        }
         uint256 next = toBlock > projected ? toBlock : projected;
         clockBlock = uint64(next);
         if (issuedAt > clockAt) clockAt = issuedAt;
@@ -471,12 +485,11 @@ abstract contract SwarmFeed is IFeed {
 
     /// @notice Refuse a value this feed should not accept. Zero always; a value further from the current
     /// epoch's anchor than its allowance: `maxDeviationBps` for an epoch opened on a fresh value,
-    /// STALE_DEVIATION_MULTIPLE times that for one opened on a stale value, and wider the longer it was
-    /// stale (`_allowanceNow`). The first value ever has no
-    /// bound on chain, and whoever relays first sets it (the relay is permissionless): the deployment buys
-    /// and relays it, and DeployMainnet.verifySeeded refuses a price or spot anchor more than a quarter of
-    /// the cap from the pool, so a raced first value is caught before deposits open (final panel audit,
-    /// oracle, low). It anchors the first epoch.
+    /// STALE_DEVIATION_MULTIPLE times that for one opened on a stale value (`_allowanceNow`; no wider
+    /// however long the silence). The first value ever has no bound on chain, and whoever relays first
+    /// sets it (the relay is permissionless): no check in this repository compares it with the market,
+    /// so the operator relays it first and checks it. It anchors the
+    /// first epoch.
     /// @dev VIRTUAL, and the reason is that the bound assumes the value is a PRICE. It is the right
     /// guard for one: a price moves continuously, so a large jump is evidence of a bad figure rather
     /// than of a fast market. It is the wrong guard for a value with no magnitude — a Merkle root is a
@@ -520,7 +533,11 @@ abstract contract SwarmFeed is IFeed {
     /// expired epoch did not already allow, and only until that epoch is older than two lifetimes and one
     /// STALE_GROWTH_PERIOD, when the stale allowance from the last value takes over. It applies only to a value
     /// the epoch rule refuses (`_fitsEpoch`), so every value accepted before is accepted and anchored as before.
-    /// Zero when no way back applies.
+    /// Zero when no way back applies. It is also bounded from the LAST accepted value, by STALE_DEVIATION_MULTIPLE x the cap
+    /// (the most any one step may move, as with the stale allowance): before, a fresh feed's way back allowed
+    /// (1 + cap) / (1 - cap) - 1 = 50% from the last value in one step (audit wave 1). Bounding it to the values between the
+    /// last one and the level instead refused an honest fall just past the level after a push the other way (a push to
+    /// 120 over a level of 100 refused 95) for about two hours: the lock-out this rule exists to prevent.
     function _returnAnchor(uint256 value) private view returns (uint256 level) {
         uint256 opened = uint256(_anchorAt);
         if (block.timestamp - opened < maxAge || block.timestamp - opened >= 2 * maxAge + STALE_GROWTH_PERIOD) {
@@ -529,12 +546,15 @@ abstract contract SwarmFeed is IFeed {
         level = _epochFirst != 0 ? uint256(_epochFirst) : (_anchorValue == 0 ? _value : _anchorValue);
         uint256 change = value > level ? value - level : level - value;
         if (change > Math.mulDiv(level, maxDeviationBps, 10_000)) return 0;
+        uint256 last = _value;
+        uint256 step = value > last ? value - last : last - value;
+        if (step > Math.mulDiv(last, maxDeviationBps * STALE_DEVIATION_MULTIPLE, 10_000)) return 0;
     }
 
     /// @notice The anchor the next value is measured against and the move it may make from it, in bps.
     /// @dev The stored epoch while it lasts; otherwise the epoch the next acceptance will open: anchored at
-    /// the current value, with the stale allowance if that value has aged past maxAge. Public so a buyer
-    /// can see, before paying, how far the feed will follow.
+    /// the current value, with the stale allowance if that value has aged past maxAge. Read publicly through
+    /// `epoch()`, so a buyer can see, before paying, how far the feed will follow.
     function _epoch() private view returns (uint256 anchor, uint256 bound) {
         if (block.timestamp - uint256(_anchorAt) < maxAge) {
             // An empty anchor slot means the first epoch has seen only its first value, which is `_value`.
@@ -550,8 +570,8 @@ abstract contract SwarmFeed is IFeed {
     /// So a genuine gap up to the stale allowance is followed once the feed has been stale long enough, and a
     /// larger one at the cap per epoch after that first step (a trend is followed; a single-step gap beyond 2x
     /// the cap is not, see the header), while a re-anchor far from the market costs an attacker that same hour
-    /// of silence, during which anyone can refresh the feed honestly for one request (the Treasury does, through
-    /// OracleAsker, once the allowance reaches WIDE_ALLOWANCE_BPS), and can never exceed 2x the cap. A push
+    /// of silence, during which anyone can refresh the feed honestly for one request (v2 has no on-chain buyer:
+    /// the keeper does), and can never exceed 2x the cap. A push
     /// relayed at the end of a live epoch needs no silence; the way back (`_returnAnchor`) is what keeps it
     /// from locking the honest level out.
     function _allowanceNow() private view returns (uint256) {
@@ -588,8 +608,8 @@ abstract contract SwarmFeed is IFeed {
     /// @dev INTERNAL rather than private, so a subclass can accept a value without an attestation.
     /// That is a deliberate, narrow door and it is worth being exact about what it does and does not
     /// guarantee. The docstring above says attestations are the only way a value is ever set; with
-    /// this visibility that is a property of THE CONTRACTS THIS REPOSITORY SHIPS — `PriceFeed`,
-    /// `NhiFeed`, `SpotFeed` and `SwarmWorkOracle` expose no path to it — rather than a property the
+    /// this visibility that is a property of THE CONTRACTS THIS REPOSITORY SHIPS — the leaves in
+    /// SwarmFeeds.sol expose no path to it — rather than a property the
     /// base enforces on every conceivable subclass.
     ///
     /// It exists because the test suite has to set values, and with the reporter fallback gone the
@@ -614,7 +634,7 @@ abstract contract SwarmFeed is IFeed {
     /// a feed whose value is an identifier (a Merkle root) overrides it to false, and with it overrides
     /// `_checkValue`. Without this a root feed silent for a lifetime and one STALE_GROWTH_PERIOD widened
     /// its allowance past 100%, and from then `_accept` reverted on almost every root, for good: silence
-    /// only widens it further (found 2026-10-10, test/WorkRootAfterSilence.t.sol).
+    /// only widens it further (found 2026-10-10 on v1's work oracle; no v2 leaf overrides this).
     function _hasMagnitude() internal pure virtual returns (bool) {
         return true;
     }
@@ -627,7 +647,7 @@ abstract contract SwarmFeed is IFeed {
         if (!_hasValue) {
             // The first value anchors the first epoch and is `_value` itself, so the anchor slot stays
             // empty until a second value arrives: the first delivery pays no extra storage write, which is
-            // what keeps it inside the Intake's callback stipend (test/OracleAskerBoundGas.t.sol).
+            // what keeps it inside the Intake's callback stipend (measured in v1, OracleAskerBoundGas).
             (_anchorBound, _anchorAt) = (uint24(maxDeviationBps), uint40(block.timestamp));
         } else if (block.timestamp - uint256(_anchorAt) >= maxAge) {
             uint256 back = _fitsEpoch(value) ? 0 : _returnAnchor(value);

@@ -26,6 +26,8 @@ import {SortedPositions} from "./SortedPositions.sol";
 /// in BUCKET-second buckets over WINDOW + BUCKET, so every 2h window, however aligned, sees at most the cap
 /// (the counted span is 10 min longer than 2h: conservative). An over-size request is filled up to what
 /// the window has left, and reverts only when nothing is left.
+/// NO SEQUENCER GRACE. Redemption does not read the Pulse (chains with one, e.g. Robinhood): a redemption can run inside a
+/// grace that holds liquidations, before borrowers could raise their rate or repay. Mainnet has no Pulse.
 contract Redeemer is TransientReentrancyGuard {
     uint256 public constant FEE_CAP = 0.05e18;
     uint256 public constant WINDOW = 2 hours;
@@ -76,7 +78,8 @@ contract Redeemer is TransientReentrancyGuard {
 
     /// @notice The type's base rate now. A type never redeemed starts AT THE CAP from the moment it went live
     /// (`Parameters.listedAt`: the seal for a genesis type, its addition for a later one) and decays from there, so
-    /// the fee falls from 5% to a 0.5% floor in ~40h after launch. Before the seal it reads the cap.
+    /// the base halves every ~12h: ~40h after launch it is ~0.5%, so with a 0.5% `redeemFloor` the fee reads ~1%, and it
+    /// is within 0.1% of the floor after ~68h. Before the seal it reads the cap.
     function decayedBaseRate(bytes32 ilk) public view returns (uint256) {
         Rate memory rt = rates[ilk];
         uint256 base = rt.baseRate;
@@ -139,11 +142,12 @@ contract Redeemer is TransientReentrancyGuard {
         }
         if (redeemed == 0) revert NothingRedeemed();
         if (collateral < minCollateralOut) revert CollateralTooLow(collateral);
+        // The type's base rate rises by the redeemed share of the circulating supply BEFORE this burn, as in v1 (read
+        // before it: inside a flash loan `circulating()` does not fall below the loan's starting supply).
+        uint256 supplyBefore = ImdUSD(address(token)).circulating();
         ledger.burnFrom(msg.sender, redeemed);
         if (r.redeemCap != 0) redeemedIn[ilk][block.timestamp / BUCKET] += redeemed;
 
-        // The type's base rate rises by the redeemed share of the circulating supply BEFORE this burn, as in v1.
-        uint256 supplyBefore = ImdUSD(address(token)).circulating() + redeemed;
         uint256 next = decayedBaseRate(ilk) + Math.mulDiv(redeemed, 1e18, supplyBefore) / r.redeemDivisor;
         rates[ilk] = Rate(uint192(Math.min(next, FEE_CAP)), uint64(block.timestamp));
         emit Redemption(ilk, msg.sender, redeemed, fee, collateral);

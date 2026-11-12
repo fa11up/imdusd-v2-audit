@@ -9,11 +9,15 @@ import {IFeed} from "../interfaces/IFeed.sol";
 
 /// @notice The current price of a Uniswap v4 pool, read in the same call: quote raw units per 1e18 raw
 /// units of `base`, 1e18-scaled (for IMD/ETH: wei of ETH per 1e18 raw IMD, the unit of v1's swarm feeds).
-/// @dev THE REDEMPTION PAYOUT LEG ONLY. It is the most manipulable price there is, so it
-/// is never used to measure a borrower: the Pricer only ever raises the payout price with it
-/// (`payout = max(high, live)`), so pushing the pool in either direction can only shrink a redeemer's
-/// collateral, never grow it. What it buys is that a rally between attested updates no longer pays the
-/// redeemer the gap (the rally-stripping finding).
+/// @dev A type's live leg. It is the most manipulable price there is, so it never measures a
+/// borrower's health. The Pricer uses it in three ways (Pricer._applyLive): it raises the payout price
+/// (`payout = max(high, live)`), so pushing the pool can only shrink a redeemer's collateral, never grow it; a leg
+/// reading 0 or stale sets the payout to 0 and clears `agree`; a pool more than `skew` below `low` clears `agree`.
+/// `agree` gates the sleeve's standing bid (Liquidator.bite) and a charged rate change (LedgerSettlement.setRate), so
+/// a push below the pair can stop both. What the leg buys is that a rally between attested updates no longer pays the
+/// redeemer the gap (the rally-stripping finding). The beta's DepthSampler references also read it
+/// (DeployConfig `_depthSamplers`): there a push-sample-push-back in one transaction lowers the measured depth, and
+/// with it the sIMD line, for the pool fee both ways (DepthSampler header).
 /// Never stale: it is the current block. Chained into USD with `ProductFeed` (x Chainlink ETH/USD) and into
 /// a share price with `RateFeed`, exactly like the attested legs.
 contract LivePoolPrice is IFeed {

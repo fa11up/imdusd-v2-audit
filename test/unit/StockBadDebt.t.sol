@@ -47,17 +47,23 @@ contract StockBadDebtTest is StockSystem {
         stock.adminBurn(address(vault), 140e18); // 70%: every share now redeems for 0.3 tokens, $30
         // alice: 100 shares x $30 = $3,000 against ~$6,016 of debt -> liquidated; the sale cannot cover it
         liquidator.liquidate(_pid(STK, alice));
+        // The sale covers its own shortfall in the same transaction (audit wave 1), the type's own interest first: the
+        // Treasury holds only that interest here, so all of it goes and the rest stays booked.
+        uint256 held = usd.balanceOf(address(treasury));
+        assertEq(held, surplus, "the Treasury's imdUSD is the type's interest");
+        vm.expectEmit(true, false, false, true, address(treasury));
+        emit Treasury.BadDebtCovered(STK, surplus, 0);
         vm.prank(taker);
         sjoin.take(_pid(STK, alice), type(uint256).max);
+        assertEq(treasury.surplusOf(STK), 0, "the type's surplus is spent first");
         (,,,, uint128 bad) = ledger.ilkState(STK);
-        assertGt(bad, 3_000e18, "the shortfall is the type's bad debt");
-        // the Treasury covers it: the type's own interest first, then the rest of its imdUSD
+        assertGt(bad, 3_000e18 - surplus, "the rest of the shortfall is the type's bad debt");
+        // the rest of the Treasury's imdUSD covers what is left
         uint256 ethInterest = 50_000e18; // stands in for other types' interest held by the Treasury
         deal(address(usd), address(treasury), usd.balanceOf(address(treasury)) + ethInterest, true);
         vm.expectEmit(true, false, false, true, address(treasury));
-        emit Treasury.BadDebtCovered(STK, surplus, uint256(bad) - surplus);
+        emit Treasury.BadDebtCovered(STK, 0, bad);
         treasury.coverBadDebt(STK);
-        assertEq(treasury.surplusOf(STK), 0, "the type's surplus is spent first");
         (,,,, bad) = ledger.ilkState(STK);
         assertEq(bad, 0);
         _supplyHoldsWithDeal(ethInterest);

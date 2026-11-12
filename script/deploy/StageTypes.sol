@@ -46,12 +46,13 @@ abstract contract StageTypes is DeployBase {
                 revert Mismatch("Join wired to another Ledger");
             }
             d.joins[i] = join;
+            ParametersBase.Config memory want = _ilkConfig(s, address(join), d.feeds);
             if (!d.params.exists(s.ilk)) {
                 g = gasleft();
-                d.params.addGenesisIlk(s.ilk, _ilkConfig(s, address(join), d.feeds), s.risk);
+                d.params.addGenesisIlk(s.ilk, want, s.risk);
                 _rec("params.addGenesisIlk", g, 1_000);
-            } else if (d.params.config(s.ilk).join != address(join)) {
-                revert Mismatch("type registered with another join");
+            } else {
+                _sameIlk(d.params, s.ilk, want, s.risk);
             }
         }
 
@@ -62,6 +63,9 @@ abstract contract StageTypes is DeployBase {
         if (cfg.stocks.types.length != 0) _deployStocks(cfg, d, me);
 
         // 3c. The chain's global debt cap, where the chain is capped. Never uncapped afterwards.
+        if (cfg.chain.capped && d.params.chainCapped() && d.params.chainLine() != cfg.chain.chainLine) {
+            revert Mismatch("chain line set by another config");
+        }
         if (cfg.chain.capped && !d.params.chainCapped()) {
             g = gasleft();
             d.params.setGenesisChainLine(cfg.chain.chainLine);
@@ -89,7 +93,16 @@ abstract contract StageTypes is DeployBase {
     function _deploySeats(DeployTypes.Config memory cfg, Deployed memory d, address me) internal {
         DeployTypes.SeatSpec memory s = cfg.seats;
         uint256 g;
-        if (!(_has(address(d.seatJoin)) && _ok(address(d.seatJoin.nft()) == s.nft && d.seatJoin.wirer() == me, "SeatJoin"))) {
+        if (
+            !(
+                _has(address(d.seatJoin))
+                    && _ok(
+                        address(d.seatJoin.nft()) == s.nft && d.seatJoin.wirer() == me && d.seatJoin.ilk() == s.ilk
+                            && d.seatJoin.maxSeats() == s.maxSeats && d.seatJoin.perBorrower() == s.perBorrower,
+                        "SeatJoin"
+                    )
+            )
+        ) {
             g = gasleft();
             d.seatJoin = new SeatJoin(s.ilk, IERC721(s.nft), IImdAgentAdapter(s.adapter), me, s.maxSeats, s.perBorrower);
             _rec("SeatJoin (+SeatAccount impl)", g, type(SeatJoin).creationCode.length + 192);
@@ -117,27 +130,35 @@ abstract contract StageTypes is DeployBase {
             d.seatSpot = new SeatSpotLeg(d.seatFeed);
             _rec("SeatSpotLeg", g, type(SeatSpotLeg).creationCode.length + 32);
         }
-        if (d.params.exists(s.ilk)) {
-            if (d.params.config(s.ilk).join != address(d.seatJoin)) revert Mismatch("SEAT registered with another join");
-            return;
-        }
+        ParametersBase.Config memory want = ParametersBase.Config({
+            token: address(d.seatJoin),
+            join: address(d.seatJoin),
+            median: IFeed(address(d.seatFeed)),
+            spot: IFeed(address(d.seatSpot)),
+            nhi: IFeed(address(0)),
+            yieldRate: address(0),
+            pegAggregator: address(0),
+            liveSpot: IFeed(address(0)),
+            redeemable: false,
+            auction: true
+        });
+        if (d.params.exists(s.ilk)) return _sameIlk(d.params, s.ilk, want, s.risk);
         g = gasleft();
-        d.params.addGenesisIlk(
-            s.ilk,
-            ParametersBase.Config({
-                token: address(d.seatJoin),
-                join: address(d.seatJoin),
-                median: IFeed(address(d.seatFeed)),
-                spot: IFeed(address(d.seatSpot)),
-                nhi: IFeed(address(0)),
-                yieldRate: address(0),
-                pegAggregator: address(0),
-                liveSpot: IFeed(address(0)),
-                redeemable: false,
-                auction: true
-            }),
-            s.risk
-        );
+        d.params.addGenesisIlk(s.ilk, want, s.risk);
         _rec("params.addGenesisIlk (SEAT)", g, 1_000);
+    }
+
+    /// @dev A type already registered (a resumed run) must be exactly the one this config registers: join, feeds, flags
+    /// and risk (audit wave 1, panel 7: only the join was compared, and a type's feeds cannot change after the seal).
+    function _sameIlk(Parameters params, bytes32 ilk, ParametersBase.Config memory c, ParametersBase.Risk memory r)
+        internal
+        view
+    {
+        if (keccak256(abi.encode(params.config(ilk))) != keccak256(abi.encode(c))) {
+            revert Mismatch("type registered with another config");
+        }
+        if (keccak256(abi.encode(params.storedRisk(ilk))) != keccak256(abi.encode(r))) {
+            revert Mismatch("type registered with other risk");
+        }
     }
 }

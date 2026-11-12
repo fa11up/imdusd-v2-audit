@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-/// @dev The slice of the Ledger a manager reads and calls. Mirrors LedgerBase.Position's ABI exactly.
+/// @dev The slice of the Ledger a manager reads and calls. `ManagedPosition` is a PREFIX of LedgerBase.Position's ABI: the
+/// first seven fields, in order; Position's eighth (`uint32 version`) is not read. A field inserted ahead of these in
+/// Position would shift every read here.
 struct ManagedPosition {
     uint128 collateral;
     uint128 debt;
@@ -174,7 +176,8 @@ contract RateManager {
         uint256 next_ = lastCall[ilk] + minInterval;
         if (lastCall[ilk] != 0 && block.timestamp < next_) revert TooSoon(next_);
         uint64 prior = lastRate[ilk];
-        if (prior != 0 && (rate > prior ? rate - prior : prior - rate) > maxStep) revert StepTooLarge();
+        // A target of 0 (allowed when minRate is 0) is a reference too (audit wave 1: `prior != 0` let the next call jump).
+        if (lastCall[ilk] != 0 && (rate > prior ? rate - prior : prior - rate) > maxStep) revert StepTooLarge();
         if (ids.length != prevHints.length || ids.length != nextHints.length) revert LengthMismatch();
         (lastCall[ilk], lastRate[ilk]) = (block.timestamp, rate);
         for (uint256 i; i < ids.length; ++i) {

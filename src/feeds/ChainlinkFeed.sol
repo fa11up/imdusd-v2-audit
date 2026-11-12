@@ -7,8 +7,10 @@ import {IFeed} from "../interfaces/IFeed.sol";
 /// `tokenDecimals`, 1e18-scaled. With `tokenDecimals = 18` and a ratio aggregator (WBTC/BTC, stETH/ETH)
 /// it yields the plain 1e18-scaled ratio, for `ProductFeed`.
 /// @dev Reads with a raw staticcall and decodes defensively, as v1's SharePriceFeed does: a feed that
-/// reverts or answers malformed data reads as zero and stale, which values collateral at nothing and
+/// reverts or answers short data reads as zero and stale, which values collateral at nothing and
 /// blocks new debt. A revert here would instead take down every action that prices this collateral.
+/// Not covered: returndata of full length whose narrow words are dirty (a roundId above 2^80, an `aggregator()`
+/// word above 2^160) fails abi.decode's validation and REVERTS. A real Chainlink proxy never answers that.
 contract ChainlinkFeed is IFeed {
     address public immutable aggregator;
     uint8 public immutable tokenDecimals;
@@ -53,7 +55,8 @@ contract ChainlinkFeed is IFeed {
 
     /// @dev Whether `answer` sits at the aggregator's minAnswer or maxAnswer. Read live from the proxy's current
     /// aggregator (`aggregator()`), so a phase change carries its own bounds; an aggregator that exposes neither (or no
-    /// proxy at all) has no clamp to detect and reads as before. A bound of <= 0 (or the int192 maximum) is "none".
+    /// proxy at all) has no clamp to detect and reads as before. A bound of <= 0 is "none" (an int192-maximum bound is
+    /// never reached: the sanity cap in `latestValue` refuses such an answer first).
     function _clamped(int256 answer) private view returns (bool) {
         (bool ok, bytes memory d) = aggregator.staticcall(abi.encodeWithSignature("aggregator()"));
         address agg = ok && d.length >= 32 ? abi.decode(d, (address)) : aggregator;

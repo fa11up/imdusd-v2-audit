@@ -71,6 +71,20 @@ contract MockSeatFeed is MockFeed {
     function setFigure(uint256 f) external {
         latestFigure = f;
     }
+
+    uint64 private relayedAt;
+
+    /// @notice Relay now an attestation signed at `signedAt` (a held or late-relayed attestation).
+    function relay(uint256 v, uint64 signedAt) external {
+        set(v);
+        at = signedAt;
+        relayedAt = uint64(block.timestamp);
+    }
+
+    /// @notice As SwarmFeed.acceptedAt: the relay time (a plain `set` relays at its own signature time).
+    function acceptedAt() external view returns (uint64) {
+        return relayedAt > at ? relayedAt : at;
+    }
 }
 
 /// @notice A Chainlink-shaped aggregator.

@@ -136,6 +136,19 @@ contract SwarmFeedTest is Test {
         assertEq(v, 3e15);
         assertEq(at, vm.getBlockTimestamp());
         assertFalse(f.isStale());
+        assertEq(f.acceptedAt(), vm.getBlockTimestamp());
+    }
+
+    /// Audit wave 1, panel 6: a held attestation reports its relay time apart from its signature (the seat clock opens there).
+    function test_acceptedAtIsTheRelayTimeNotTheSignature() public {
+        TestPriceFeed f = new TestPriceFeed(attester, 1 hours);
+        SwarmFeed.OracleAttestation memory a = _att(f, 25_999_990, 3e15);
+        uint64 signedAt = a.issuedAt;
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        _submit(f, a);
+        (, uint64 at) = f.latestValue();
+        assertEq(at, signedAt, "latestValue keeps the signature time");
+        assertEq(f.acceptedAt(), signedAt + 30 minutes, "acceptedAt is when it was relayed");
     }
 
     function test_absoluteFloorsNeverARatio() public {

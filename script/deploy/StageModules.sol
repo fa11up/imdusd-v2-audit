@@ -22,7 +22,7 @@ import {DeployBase} from "./DeployBase.sol";
 /// linked libraries, the hook at a mined CREATE2 address, its NoOp pool, the lens). Only a script that inherits this
 /// contract links CompoundCurve/CompoundOracle, so the beta's stages never deploy them.
 abstract contract StageModules is DeployBase {
-    // 6. Earn vaults. No owner, no wirer: fixed at construction.
+    // 5a. LoopVault. No owner, no wirer: fixed at construction.
     function _stageModules(DeployTypes.Config memory cfg, Deployed memory d) internal {
         uint256 g;
         if (cfg.loopVault.enabled) {
@@ -42,7 +42,7 @@ abstract contract StageModules is DeployBase {
             }
         }
 
-        // 7. The Compound DEX: libraries at deterministic addresses, hook at a mined CREATE2 address, its
+        // 5b. The Compound DEX: libraries at deterministic addresses, hook at a mined CREATE2 address, its
         // NoOp pool initialised at the opening price. No liquidity: the first deposit is a Safe act.
         if (cfg.dex.enabled) _deployDex(cfg, d);
     }

@@ -6,6 +6,7 @@ pragma solidity 0.8.26;
 /// bite), the keeper and anyone may `poke()`, which records the time. A poke that finds more than `gap` seconds since the
 /// previous one has just ended a silence the chain may have imposed (a halted or censoring sequencer), so it opens a
 /// `grace` window. While it runs, liquidations may MARK but not seize: borrowers get the time the outage took from them.
+/// Redemptions are not held (the Redeemer does not read the grace).
 ///
 /// Why a liquidator cannot skip it: the grace is started by whichever poke ends the long gap, and the Liquidator pokes
 /// before it checks, so the first liquidation after a silence starts the grace itself and is held by it (and does not

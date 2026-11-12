@@ -138,8 +138,10 @@ contract PositionNFT is ERC721, EIP712 {
         return ILedgerExecute(ledger).execute(owner, ilk, salt, 0, a, msg.sender);
     }
 
-    /// @notice Borrow `amount` on position `id` (which must already have debt: the rate is the position's) to `to` (zero:
-    /// its owner), by its owner's `BorrowFor` signature.
+    /// @notice Borrow `amount` on position `id` to `to` (zero: its owner), by its owner's `BorrowFor` signature. Meant for a
+    /// position that has debt: the borrow keeps the position's rate (it passes rate 0). Nothing here checks that: on a
+    /// position whose debt reached zero before inclusion the Ledger takes rate 0 as the opening rate, which reverts
+    /// (RateOutOfRange) on every type whose `rateFloor` is above 0 (all beta types).
     function borrowFor(uint256 id, uint256 amount, address to, uint256 maxUpfrontFee, uint256 deadline, bytes calldata sig)
         external
     {

@@ -27,8 +27,23 @@ abstract contract StageFeeds is DeployBase {
             }
             uint256 g = gasleft();
             d.feeds[i] = _feed(cfg.feeds[i], d.feeds, i);
-            if (cfg.feeds[i].kind != DeployTypes.EXISTING) _rec("feed node", g, 3_000);
+            if (cfg.feeds[i].kind != DeployTypes.EXISTING) _rec("feed node", g, _initLen(cfg.feeds[i].kind));
         }
+    }
+
+    /// @dev The node's init code (creation code + a bound on its constructor arguments) for the gas log's calldata term
+    /// (audit wave 1: a flat 3,000 B under-counted the swarm leaves, whose question constants make them 11-13 KB).
+    function _initLen(uint8 kind) internal pure returns (uint256 len) {
+        if (kind == DeployTypes.CHAINLINK) len = type(ChainlinkFeed).creationCode.length;
+        else if (kind == DeployTypes.PRODUCT) len = type(ProductFeed).creationCode.length;
+        else if (kind == DeployTypes.RATE) len = type(RateFeed).creationCode.length;
+        else if (kind == DeployTypes.SWARM_PRICE) len = type(SwarmPriceFeed).creationCode.length;
+        else if (kind == DeployTypes.SWARM_SPOT) len = type(SwarmSpotFeed).creationCode.length;
+        else if (kind == DeployTypes.SWARM_NHI) len = type(SwarmNhiFeed).creationCode.length;
+        else if (kind == DeployTypes.SWARM_SEAT_MEDIAN) len = type(SwarmSeatMedianFeed).creationCode.length;
+        else if (kind == DeployTypes.SWARM_SEAT_SPOT) len = type(SwarmSeatSpotFeed).creationCode.length;
+        else if (kind == DeployTypes.LIVE_POOL) len = type(LivePoolPrice).creationCode.length;
+        return len + 192;
     }
 
     function _feed(DeployTypes.FeedNode memory n, IFeed[] memory built, uint256 i) internal returns (IFeed) {

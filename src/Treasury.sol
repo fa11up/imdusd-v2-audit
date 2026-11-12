@@ -30,6 +30,11 @@ interface IEdgeCover {
     function coverBadDebt(bytes32 ilk) external returns (uint256);
 }
 
+/// @dev The fee notes' face sold and not yet redeemed (FeeNotes.outstanding).
+interface INoteBook {
+    function outstanding() external view returns (uint256);
+}
+
 /// @notice Receives interest (imdUSD), liquidation cuts and harvested yield shares. Scope:
 /// hold, cover bad debt, and pay out only through the 48h timelock.
 /// @dev `coverBadDebt` and `retireReserve` are permissionless because both only burn the Treasury's own
@@ -132,11 +137,14 @@ contract Treasury is Governed {
     }
 
     /// @notice Burn `amount` of Treasury imdUSD against reserve-backed supply. Never while bad debt is booked: the same balance is
-    /// what covers it, and anyone may call this.
+    /// what covers it, and anyone may call this. It leaves the fee notes' outstanding face (audit
+    /// wave 1: a stranger could burn what pays matured notes, so every redemption reverted until the Safe refunded it).
     function retireReserve(uint256 amount) external {
         if (ledger.totalBadDebt() != 0) revert BadDebtOutstanding();
         uint256 bal = token.balanceOf(address(this));
-        ledger.retire(amount < bal ? amount : bal);
+        uint256 keep = notes == address(0) ? 0 : INoteBook(notes).outstanding();
+        uint256 free = bal > keep ? bal - keep : 0;
+        ledger.retire(amount < free ? amount : free);
     }
 
     // ---------------------------------------------------------------- revenue meter
@@ -181,8 +189,10 @@ contract Treasury is Governed {
     // ---------------------------------------------------------------- fee notes
 
     /// @notice Pay a matured note: `amount` imdUSD from this balance to `to`. The notes contract only.
+    /// Refused while bad debt is booked: cover keeps first call on this balance (anyone may `coverBadDebt` first; audit wave 1).
     function payNote(address to, uint256 amount) external {
         if (msg.sender != notes) revert Unauthorized();
+        if (ledger.totalBadDebt() != 0) revert BadDebtOutstanding();
         token.safeTransfer(to, amount);
         emit NotePaid(to, amount);
     }

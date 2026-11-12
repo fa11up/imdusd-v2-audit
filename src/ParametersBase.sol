@@ -24,6 +24,8 @@ interface IAssetView {
 interface IBridgeSettable {
     function setBridge(address bridge) external;
     function setKeeper(address keeper) external;
+    function bridge() external view returns (address);
+    function keeper() external view returns (address);
 }
 
 interface INoteSeries {
@@ -39,7 +41,7 @@ interface ISleeve {
     function disableIlk(bytes32 ilk) external;
     function isToken(address token) external view returns (bool);
     function tokenCount() external view returns (uint256);
-    function MAX_TOKENS() external view returns (uint256);
+    function ilkCount() external view returns (uint256);
     function EDGE_MULTIPLE() external view returns (uint256);
     function netVested() external view returns (uint256);
     function edgeCapacity(bytes32 ilk, uint256 inAuction) external view returns (uint256);
@@ -142,7 +144,8 @@ abstract contract ParametersBase is GovernedByKind {
     uint256 public constant MAX_SEATS = 2000; // the collection's supply
     uint256 public constant MAX_SEATS_PER_BORROWER = 50;
     uint8 public constant MAX_CLAIM_RULE = 2;
-    /// @notice The chain's global debt cap, on chains whose genesis capped it (Robinhood); mainnet is uncapped.
+    /// @notice The chain's global debt cap, on chains whose genesis capped it (`setGenesisChainLine`): Robinhood,
+    /// and the mainnet beta (300k). The full MainnetConfig is uncapped. A capped chain stays capped; this only moves the line.
     uint8 public constant SET_CHAIN_LINE = 11;
     uint256 public constant MAX_CHAIN_LINE = 50_000_000e18;
     /// @notice Debt-cap groups (stock + SGOV types together within 25% of the chain): a type's group and a group's
@@ -162,10 +165,12 @@ abstract contract ParametersBase is GovernedByKind {
     /// `depthCap` (USD, 1e18; 0 = none) that the governor lowers at once (`postLowerDepth`) and raises or clears only
     /// through SET_DEPTH (48h). Chains without an ImdDepth fall back to the posted figure alone. `redeemCap` is the
     /// type's own `Risk.redeemCap`, the figure the Redeemer enforces per 2h window. Raising the line, chop or redeemCap
-    /// (SET_RISK), raising k (SET_DEPTH_K) or posting a depth (SET_DEPTH) goes through the 48h timelock, and a raise
-    /// applies only if the rule then holds. Lowering the line, k or the depth is instant by the governor; if that breaks
-    /// the rule nothing is forced (positions are untouched), `DepthRuleBroken` is emitted, and no raise applies until
-    /// the rule holds again. Not checked at genesis (the beta opens the type at line 0). Because depth now MOVES, the rule
+    /// (SET_RISK), raising k (SET_DEPTH_K) or posting a depth (SET_DEPTH) goes through the 48h timelock, and a raise of the
+    /// line, chop, redeemCap or k applies only if the rule then holds (SET_DEPTH is not checked: a higher depth ceiling
+    /// cannot worsen the rule). Lowering the line, k or the depth is instant by the governor; if that breaks the rule
+    /// nothing is forced, `DepthRuleBroken` is emitted, and no raise applies until the rule holds again. A line below the
+    /// type's debt stops new draws and in-cooldown rate changes (the line binds the cooldown premium); repay, redemption
+    /// and liquidation carry on. Not checked at genesis (the beta opens the type at line 0). Because depth now MOVES, the rule
     /// also binds live: `risk(depthIlk).line` reads min(stored line, `depthLine()`), the largest line the rule allows at
     /// today's depth, so a fall in depth (or no samples at all: depth 0) stops new debt on the type at once, while repay,
     /// redemption and liquidation (which never check the line) carry on.
@@ -193,8 +198,9 @@ abstract contract ParametersBase is GovernedByKind {
     /// Moved only through the timelock, inside MAX_LULL.
     uint8 public constant SET_MAX_LULL = 20;
     uint256 public constant MAX_LULL = 6 hours;
-    /// @notice A type's BORROW price ceiling (Sky's capped OSM): borrowing, withdrawing and a charged rate change
-    /// are measured at min(low, cap) (`Pricer.Quote.borrow`); liquidation health, liquidation prices and redemption payouts
+    /// @notice A type's BORROW price ceiling (Sky's capped OSM): borrowing and withdrawing (every adjust but a
+    /// de-risking repay-and-withdraw) are measured at min(low, cap) (`Pricer.Quote.borrow`); a charged rate change is
+    /// measured at `low` (it is not a borrow); liquidation health, liquidation prices and redemption payouts
     /// never see the cap, so it can only make borrowing harder and never shelters or condemns an open position. 0 = none.
     /// In the Pricer's price units (USD, 1e18, per 1e18 collateral units). Setting one where there is none, or lowering
     /// it, is instant by the governor (`lowerCap`); raising goes through SET_CAP (48h), at most x2 of the cap in force when

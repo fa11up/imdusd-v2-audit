@@ -254,6 +254,22 @@ abstract contract BackstopBase is Test {
 contract BackstopTest is BackstopBase {
     // ------------------------------------------------------------ deposits and maturity
 
+    /// Audit wave 1: a stranger cannot fill a user's two pending slots with dust; a deposit for someone else only adds to
+    /// their slot of today, and the user's own deposits are never blocked by it.
+    function test_strangerCannotFillAUsersPendingSlots() public {
+        vm.prank(bob);
+        vm.expectRevert(Backstop.TooManyPending.selector);
+        blue.deposit(1, alice); // alice has no slot today: a stranger cannot open one
+        _deposit(blue, alice, 10e18);
+        vm.prank(bob);
+        blue.deposit(5e18, alice); // adding to alice's slot of today is fine (a gift)
+        skip(1 days);
+        vm.prank(bob);
+        vm.expectRevert(Backstop.TooManyPending.selector);
+        blue.deposit(1, alice); // a new day: no slot of alice's to add to
+        _deposit(blue, alice, 10e18); // alice's own deposit opens her second slot
+    }
+
     /// Value already in an empty pool (premium that vested before anyone joined, an exit's remainder) belongs to DEAD's shares,
     /// minted at the first conversion: entries and exits then price over the same supply, and a later depositor cannot buy the
     /// earlier ones' earnings at a discount. With an entry-only offset bob took 400 of alice's 1,200.

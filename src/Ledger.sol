@@ -134,47 +134,12 @@ contract Ledger is LedgerBase {
         _adjust(id, a, msg.sender, true);
     }
 
-    /// @notice Change a position's rate (its owner, or an operator with SET_RATE). A change within RATE_COOLDOWN of the last
-    /// (either direction) adds RATE_COOLDOWN of interest at the old rate to the debt (minted as interest); after the
-    /// cooldown it is free.
-    function setRate(uint256 id, uint64 newRate, uint256 prevHint, uint256 nextHint) external nonReentrant {
-        bytes32 ilk = _ilkOf(id);
-        if (msg.sender != nft.ownerOf(id)) nft.checkRights(id, msg.sender, RIGHT_SET_RATE);
-        ParametersBase.Config memory c = _config(ilk);
-        ParametersBase.Risk memory r = params.storedRisk(ilk);
-        if (newRate < r.rateFloor || newRate > MAX_RATE) revert RateOutOfRange();
-        Pricer.Quote memory q = _quote(ilk);
-        Position storage p = _positions[id];
-        IlkState storage s = ilkState[ilk];
-        _accrue(ilk, s);
-        uint256 oldDebt = p.debt;
-        uint256 oldRate = p.rate;
-        uint256 debt = _harvest(ilk, id, c, r, q, s, p, _debtOf(p));
-        if (debt == 0) revert NoDebt();
-        uint256 premium;
-        bool inCooldown = block.timestamp < p.lastRateChange + RATE_COOLDOWN;
-        if (newRate != oldRate && inCooldown) {
-            // Only the owner may pay a cooldown premium; SET_RATE alone must not be able to add debt.
-            if (msg.sender != nft.ownerOf(id)) revert NotOwner(); // re-read: a local here is one stack slot too many for solc
-            premium = _premium(debt, oldRate);
-            debt += premium;
-            s.debt += premium.toUint128();
-            if (uint256(s.debt) + s.badDebt > params.risk(ilk).line) revert CeilingExceeded(); // `r` is the stored risk: the depth rule binds here
-            _checkLines(ilk);
-            _checkEdge(ilk);
-            _mintInterest(ilk, premium);
-            if (!q.borrowable || !q.agree) revert NotPriced(); // a pair above the pool is not a price to add debt at
-            // A rate change is not a borrow, so the cap does not measure its premium.
-            if (!_healthy(p.collateral, debt, q.low, q.mat)) revert Unhealthy();
-            p.version = uint32(params.riskVersion(ilk)); // a risk-increasing action rebinds to the newest version
-        }
-        // A charged change leaves its old rate for top-ups inside the new cooldown; a free one leaves none.
-        if (newRate != oldRate) p.premiumRate = inCooldown ? uint64(oldRate) : 0;
-        else if (!inCooldown) p.premiumRate = 0; // the clock restarts below: a lapsed premium must not come back with it
-        p.lastRateChange = uint64(block.timestamp);
-        _record(s, p, oldDebt, oldRate, debt, newRate);
-        if (c.redeemable) _relist(ilk, id, true, true, true, prevHint, nextHint);
-        emit RateSet(id, ilk, newRate, premium);
+    /// @notice Change a position's rate (its owner, or an operator with SET_RATE). A change within RATE_COOLDOWN of this
+    /// position's last change adds RATE_COOLDOWN of interest at the old rate to the debt (only the owner may pay it); after
+    /// the cooldown it is free. The cooldown is per id: a fresh position is not bound by it (see RATE_COOLDOWN)
+    /// (LedgerSettlement.setRate: moved out for size, audit wave 1).
+    function setRate(uint256, uint64, uint256, uint256) external {
+        _settle();
     }
 
     /// @notice Harvest yield into debt for a batch of positions of one type. Permissionless; also runs on every touch.
@@ -253,7 +218,8 @@ contract Ledger is LedgerBase {
             uint256 amount = uint256(a.dDebt);
             // F1 (Liquity v2): every debt increase pays RATE_COOLDOWN of interest on the amount at the TYPE'S average rate,
             // read before this borrow; on an empty type, at the borrower's own rate. A rate drop through a fresh position
-            // (repay, move the collateral, reborrow lower) therefore costs at least the market's 7 days of interest.
+            // (repay, move the collateral, reborrow lower) therefore costs 7 days at the market's average rate, not at the old
+            // rate; on a type where the borrower is (nearly) alone that average is the new rate he chose.
             {
                 uint256 fee = _upfrontFee(s, amount, hadDebt ? p.rate : a.rate, _debtOf(p) - debt);
                 if (fee > a.maxUpfrontFee) revert UpfrontFeeTooHigh(fee);
@@ -273,7 +239,7 @@ contract Ledger is LedgerBase {
                     // Choosing the rate is a rate change: an operator needs SET_RATE for it too.
                     if (!self) nft.checkRights(id, actor, RIGHT_SET_RATE);
                     bool charged = oldRate != 0 && block.timestamp < p.lastRateChange + RATE_COOLDOWN;
-                    p.premiumRate = charged ? oldRate : 0;
+                    p.premiumRate = charged ? (p.premiumRate != 0 ? p.premiumRate : oldRate) : 0; // first of a chain
                     p.lastRateChange = uint64(block.timestamp);
                 }
                 p.rate = a.rate;
@@ -326,7 +292,9 @@ contract Ledger is LedgerBase {
         if (debt != 0 && (a.dDebt > 0 || a.dCollateral < 0)) {
             if (!q.borrowable) revert NotPriced();
             if (!_healthy(p.collateral, debt, _adjustPrice(a, p.collateral, debt, q), q.mat)) revert Unhealthy();
-            p.version = uint32(params.riskVersion(ilk)); // a risk-increasing action rebinds to the newest version
+            // A risk-increasing action rebinds to the newest version; a de-risking repay-and-withdraw does not (audit wave 1: it
+            // bound the position to a version still in its grace, while an untouched one kept the week to repair).
+            if (!_deRisking(a, p.collateral, debt)) p.version = uint32(params.riskVersion(ilk));
         }
 
         _record(s, p, oldDebt, oldRate, debt, p.rate);
@@ -346,9 +314,14 @@ contract Ledger is LedgerBase {
         pure
         returns (uint256)
     {
-        if (a.dDebt >= 0 || a.dCollateral >= 0) return q.borrow;
+        return _deRisking(a, collateral, debt) ? q.low : q.borrow;
+    }
+
+    /// @dev A repay-and-withdraw that does not lower the collateral ratio.
+    function _deRisking(Adjust memory a, uint256 collateral, uint256 debt) private pure returns (bool) {
+        if (a.dDebt >= 0 || a.dCollateral >= 0) return false;
         uint256 before = collateral + uint256(-a.dCollateral);
-        return collateral * (debt + uint256(-a.dDebt)) >= before * debt ? q.low : q.borrow;
+        return collateral * (debt + uint256(-a.dDebt)) >= before * debt;
     }
 
     /// @dev The rights an operator needs for `a`; withdrawals and borrows to the owner need the narrower right.
@@ -457,23 +430,44 @@ contract Ledger is LedgerBase {
     }
 
     /// @notice The debt one liquidation of `id` at `price` would repay now: the whole debt on a type that closes
-    /// in full, or what restores `mat + targetBuffer`. 0 if already at the target.
+    /// in full, or what restores `mat + targetBuffer`. 0 if already at the target. Measured after the pending harvest, which
+    /// the liquidation runs first.
     function liquidationNeed(uint256 id, uint256 price) external view returns (uint256) {
-        bytes32 ilk = ilkOf[id];
-        ParametersBase.Risk memory r = params.storedRisk(ilk);
-        Position storage p = _positions[id];
-        uint256 buffer = params.config(ilk).auction ? 0 : params.targetBuffer(ilk);
-        (uint256 mat, uint256 chop) = _liq(ilk, p, pricer.quote(ilk).mat);
-        return _liquidationNeed(p.collateral, _debtOf(p), price, mat, chop, buffer, r.dust);
+        (, ParametersBase.Risk memory r, bool auction, uint256 mat, uint256 chop, uint256 collateral, uint256 debt) =
+            _liqView(id);
+        uint256 buffer = auction ? 0 : params.targetBuffer(ilkOf[id]);
+        return _liquidationNeed(collateral, debt, price, mat, chop, buffer, r.dust);
     }
 
-    /// @notice Liquidation health, at the position's bound risk version.
+    /// @notice Liquidation health, at the position's bound risk version, after the pending harvest (which the
+    /// liquidation runs first; every borrower touch runs it before its own health check too).
     function healthy(uint256 id) external view returns (bool ok, bool priced) {
+        (Pricer.Quote memory q,,, uint256 mat,, uint256 collateral, uint256 debt) = _liqView(id);
+        return (_healthy(collateral, debt, q.low, mat), q.priced);
+    }
+
+    /// @dev What liquidation reads for `id`: the quote, risk, bound mat/chop, and the position after its pending harvest.
+    function _liqView(uint256 id)
+        private
+        view
+        returns (
+            Pricer.Quote memory q,
+            ParametersBase.Risk memory r,
+            bool auction,
+            uint256 mat,
+            uint256 chop,
+            uint256 collateral,
+            uint256 debt
+        )
+    {
         bytes32 ilk = ilkOf[id];
-        Pricer.Quote memory q = pricer.quote(ilk);
         Position storage p = _positions[id];
-        (uint256 mat,) = _liq(ilk, p, q.mat);
-        return (_healthy(p.collateral, _debtOf(p), q.low, mat), q.priced);
+        ParametersBase.Config memory c = params.config(ilk);
+        q = pricer.quote(ilk);
+        r = params.storedRisk(ilk);
+        auction = c.auction;
+        (mat, chop) = _liq(ilk, p, q.mat);
+        (collateral, debt) = _afterHarvest(c, r.yieldFee, q, p);
     }
 
 }

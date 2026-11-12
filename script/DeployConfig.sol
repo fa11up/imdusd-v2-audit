@@ -182,7 +182,8 @@ library DeployTypes {
     }
 
     /// @notice The two sleeves (blue, edge), their PricerOracle and the Allocator (their seller). Fungible types only: seat
-    /// (auction) and stock types keep their Dutch auctions. `freezer` = the guardian key (zero refused off a local fork).
+    /// (auction) and stock types keep their Dutch auctions. `freezer` = the Safe on mainnet;
+    /// nothing on chain refuses zero.
     struct BackstopSpec {
         bool enabled;
         SleeveIlk[] ilks;
@@ -231,8 +232,6 @@ library DeployTypes {
     }
 }
 
-/// @notice Ethereum mainnet. Addresses from test/fork/MainnetAddresses.sol (each read on chain 2026-10-16).
-/// Debt ceilings, the migrator line and the flash cap are PROPOSED values, subject to governance sign-off.
 /// @notice D1/E1: the largest whole-imdUSD line the depth rule admits:
 ///   line x (1 + chop) + redeemCap + otherLines x (1 + otherChop) <= k x depth   (Parameters.depthRule)
 /// capped at `target`. A line in a config is a TARGET; the line set is this, so it grows only as the posted depth does.
@@ -250,6 +249,8 @@ library DepthMath {
     }
 }
 
+/// @notice Ethereum mainnet. Addresses from test/fork/MainnetAddresses.sol (each read on chain 2026-10-16).
+/// Debt ceilings, the migrator line and the flash cap are PROPOSED values, subject to governance sign-off.
 library MainnetConfig {
     /// @notice A peg position holds imdUSD + USDC at ~2x its imdUSD debt and is solvent in imdUSD terms at every
     /// price (below the band its shares are all imdUSD, which repays the debt at par; above it, ~2x the debt in USDC), so
@@ -371,9 +372,12 @@ library MainnetConfig {
     /// @dev Band 1500 = -15%, the analysis' definition. The IMD reference is the LIVE pool price x ETH/USD (F_IMD_USD_LIVE), on
     /// purpose, not an attested leg: the attested legs are bought on demand and are stale most hours, and DepthSampler refuses to
     /// sample on a stale feed, so an attested reference would stop sampling and read as zero depth. The live reference can be
-    /// pushed: a sampler refuses to read while the PoolManager is unlocked, so a push needs capital across separate calls (a
-    /// sandwich), and the 4th-lowest bucket and 4th-lowest hour (ImdDepth) must be moved for it to count. What remains is
-    /// accepted (see Known issues in the README); it can only lower the sIMD line, under the 2x/day rise cap and the posted cap.
+    /// pushed with no capital held: push, sample, push back in one transaction (between two unlocks) or one bundle, for the
+    /// pool fee both ways, ~2% of the push (audit wave 1; DepthSampler header). The 4th-lowest bucket and 4th-lowest hour
+    /// (ImdDepth) must be moved for it to count, so four pushed hours (~$200 each for 25%) lower the sIMD line for ~8 days.
+    /// Accepted for the beta (audit wave 1); it can only lower the sIMD line. Sampler 0's
+    /// reference is its own pool's price, so its `maxDeviationTicks` guard can never fire; samplers 1 and 2 are measured
+    /// against pool 0xb07d's price.
     function _depthSamplers(DeployTypes.Config memory c) private pure {
         c.depth.enabled = true;
         c.depth.samplers = new DeployTypes.SamplerSpec[](3);
@@ -439,9 +443,11 @@ library MainnetConfig {
         c.feeds[F_BTC] = _cl(CL_BTC_USD, 8, 1 hours + 10 minutes);
         c.feeds[F_WBTC_BTC] = _cl(CL_WBTC_BTC, 18, 1 days + 1 hours);
         c.feeds[F_WBTC] = _product(F_BTC, F_WBTC_BTC);
-        c.feeds[F_USDS] = _cl(CL_USDS_USD, 18, 1 days);
+        // 24h heartbeat + 1h, as USDT and the peg quote: at exactly 1 day the USDC/USDS types read stale around every
+        // heartbeat update (audit wave 1).
+        c.feeds[F_USDS] = _cl(CL_USDS_USD, 18, 1 days + 1 hours);
         c.feeds[F_SUSDS] = _rate(SUSDS, CONVERT, true, F_USDS);
-        c.feeds[F_USDC] = _cl(CL_USDC_USD, 6, 1 days);
+        c.feeds[F_USDC] = _cl(CL_USDC_USD, 6, 1 days + 1 hours);
         c.feeds[F_SUSDC] = _rate(METAMORPHO_STEAKHOUSE_USDC, CONVERT, true, F_USDC);
         c.feeds[F_USDT] = _cl(CL_USDT_USD, 6, 1 days + 1 hours);
         c.feeds[F_IMD_MEDIAN] = _swarm(DeployTypes.SWARM_PRICE, IMD_LEG_MAX_AGE);
@@ -504,6 +510,10 @@ library MainnetConfig {
         b.enabled = true;
         b.edgePremium = 0.2e18; // 20% of edge-type interest to the edge sleeve
         b.maxSlippageBps = 200;
+        // The Allocator's freezer from genesis (audit wave 1) is the Safe: there is no separate freezer key.
+        // The four discretionary Allocator jobs are rule-driven, so no keeper key routes protocol funds and nothing needs a
+        // faster stop than the Safe; each action's daily bucket bounds a loss until it signs. The protocol's watcher alerts.
+        b.freezer = GOVERNANCE_SAFE;
         b.ilks = new DeployTypes.SleeveIlk[](7);
         b.ilks[0] = DeployTypes.SleeveIlk("ETH", false, 0, 50e18);
         b.ilks[1] = DeployTypes.SleeveIlk("WSTETH", false, 0, 40e18);
@@ -676,7 +686,9 @@ library BetaConfig {
         // and 300k once the day-7 sIMD line reaches its 50k target; 340k with the seat type's 40k, where the chain line binds.
         // Raising it is SET_CHAIN_LINE (48h); it can never be removed.
         (c.chain.capped, c.chain.chainLine) = (true, TOTAL_LINES);
-        c.backstop = MainnetConfig.backstopSpec(SIMD_LINE_TARGET); // the edge bootstrap = the beta's day-7 sIMD target
+        // The edge bootstrap's genesisLine = the beta's sIMD target. It falls linearly to 0 over 60 days from the genesis
+        // listing (Backstop.bootstrap), so on day 7 it is 50k x 53/60 (~44.2k), on day 20 ~33.3k, on day 60 zero.
+        c.backstop = MainnetConfig.backstopSpec(SIMD_LINE_TARGET);
         // sIMD is bitten as soon as it is marked in the beta (no 6h grace). Restoring the grace is a
         // SET_MAX_LULL proposal (48h), no redeploy.
         c.graceOff = true;

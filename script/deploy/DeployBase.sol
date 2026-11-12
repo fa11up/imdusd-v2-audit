@@ -52,8 +52,10 @@ import {StockJoin} from "../../src/stocks/StockJoin.sol";
 /// links) nothing it does not deploy itself. script/Deploy.s.sol is every stage in order (one run); the launch scripts
 /// (not included in this snapshot) are one stage each.
 ///
-/// Every stage function is idempotent: a contract already in `d` with code (and the expected wiring) is kept, anything
-/// else is deployed. A fresh `Deployed` (all zero) therefore runs every step exactly as the single-run deploy always did.
+/// Every stage function can be re-run: a contract already in `d` with code and the checked wiring is kept, one with no
+/// code is deployed, and one with code but other wiring stops the run (`Mismatch`) for a person to decide. Each step
+/// checks the fields it names, not every property of the contract. A fresh `Deployed` (all zero) therefore runs every
+/// step exactly as the single-run deploy always did.
 abstract contract DeployBase is Script {
     struct Deployed {
         ImdUSD usd;

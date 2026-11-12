@@ -28,10 +28,12 @@ interface IDepthPool {
 /// A previous day with no recorded low counts as 0: the keeper `poke`s hourly, and a week of silence must not read as
 /// depth. So a fresh deployment reads 0 for its first 6 days (deploy it at least 8 days before a depth-gated line opens).
 ///
-/// FAIL CLOSED AND NEVER REVERTS. A sampler or leg that reverts or is stale contributes 0 (the leg: when configured, its
-/// staleness makes depth 0). Readers (Parameters.risk for the depth-gated type, read only where a line is checked:
-/// liquidation reads storedRisk) therefore never revert through this contract: a broken input only lowers the line, which only stops
-/// new debt. Listing and removal are Parameters' (timelocked listing, instant removal); no owner, no other knob.
+/// FAIL CLOSED. A sampler or leg that reverts or is stale contributes 0 (the leg: when configured, its staleness makes
+/// depth 0). One exception: `attested()` multiplies the leg by its ETH/USD price with checked arithmetic, so an absurdly
+/// large attested leg (a SwarmFeed's first value has no on-chain bound) makes `attested()` and `depth()` revert. Parameters
+/// reads `depth()` in a try/catch (`depthIMD`: a revert reads 0), so Parameters.risk for the depth-gated type (read only
+/// where a line is checked: liquidation reads storedRisk) never reverts through this contract: a broken input only lowers
+/// the line, which only stops new debt. A keeper or integrator calling `depth()` directly can see that revert. Listing and removal are Parameters' (timelocked listing, instant removal); no owner, no other knob.
 contract ImdDepth {
     uint256 public constant MAX_SAMPLERS = 6;
     uint256 public constant DAYS = 7;

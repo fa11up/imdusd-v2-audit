@@ -32,9 +32,18 @@ What this core adds over a plain CDP:
   a 60-day bootstrap allowance)). Deposits wait a day bucket, withdrawals queue 7 days and must be claimed within 2.
   `PricerOracle` gives the sleeves their prices from the Pricer's quotes.
 - **Partial liquidation to a target.** A fungible type with a target buffer repays only what restores `mat + buffer`.
-- **Allocator.** The keeper's only way to move protocol funds, modelled on Spark's ALM controller: no recipient argument
-  anywhere, allowlisted targets, a refilling rate limit per (action, target), slippage bounds from two feeds, a freezer
-  key that can only freeze and remove keepers. It also runs Backstop collateral sales.
+- **Allocator.** The only way protocol funds move, modelled on Spark's ALM controller: no recipient argument anywhere,
+  allowlisted targets, a refilling rate limit per (action, target), slippage bounds from two feeds, and a freezer (the
+  Safe) that can stop it. Its four discretionary jobs are RULE-DRIVEN: anyone may call them and the contract picks amount,
+  price and route. Seized collateral sells by a descending auction per (sleeve, token) (103% of the sleeve's highest
+  price, `max(low, high, redemption payout)`, falling to 98% of `low` over 2 hours, paid in imdUSD straight to the sleeve
+  through `Backstop.sell` and never under its floor; collateral that arrives later stops the price until anyone restarts
+  the run, so it is always offered from the top);
+  `rebalanceVault` keeps a Safe-set amount of an asset liquid and deposits the rest in its one approved vault;
+  `topUpBuffer` fills the peg buffer to its target; `rebalanceLp` moves protocol-owned `PegLPVault` shares toward a target
+  behind a spot-versus-TWAP gate (no target set means no rule). A keeper role still exists for manual actions; the beta
+  adds none. At genesis nothing is allowlisted: every Allocator action, collateral sales included, waits until the Safe's
+  48-hour setup applies (targets, buckets, auto vault, LP target).
 - **PEG positions.** A position type whose collateral is `PegLPVault` shares (the protocol's imdUSD/USDC peg-pool LP
   vault on the `PegHook` pool). `PegPositionZap` takes a user's USDC, flash-mints imdUSD, deposits both in the vault's
   proportion, wraps the shares 1:1 as `PegCollateral` (only the zap can mint it) and borrows exactly the imdUSD placed:
@@ -64,7 +73,7 @@ network is needed for the offline suites.
 
 ```bash
 forge build                                                    # solc via_ir: a clean build takes a long time
-forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,179 tests)
+forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,267 tests)
 forge build --use solar && forge test --use solar --no-match-path 'test/fork/*'   # fast dev loop (see below)
 
 # Fork suites: one file at a time, single-threaded (in parallel, set-up calls hit RPC rate limits)
@@ -85,7 +94,7 @@ with a small script (the same rule as `cloc`'s code lines; pragma and import lin
 higher figures than the previous snapshot's table (for example 1,049 against 1,014 for the same old core files), so
 compare areas within this table, not across snapshots.
 
-**Round 1: what the beta deploys (7,156 nSLOC)**
+**Round 1: what the beta deploys (7,537 nSLOC)**
 
 The beta is `script/DeployBeta.s.sol`, which runs `script/Deploy.s.sol` with `BetaConfig` (`script/DeployConfig.sol`):
 the full mainnet config with lower lines, a 300k chain-wide debt cap, seats on, and LoopVault and the DEX off. It
@@ -93,14 +102,14 @@ deploys every contract below.
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,504 |
-| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 528 |
-| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min` | 594 |
+| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,577 |
+| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 553 |
+| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min` | 609 |
 | D. Peg | `PegHook`, `FeeNotes` | 596 |
-| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,111 |
-| F. Seats | `SeatAccount`, `SeatJoin`, `SeatFeed` | 796 |
+| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,124 |
+| F. Seats | `SeatAccount`, `SeatJoin`, `SeatFeed` | 829 |
 | G. Peg LP vault and PEG positions | `PegLPVault`, `PegCollateral`, `PegShareFeed`, `PegPositionZap` | 599 |
-| H. Backstop and Allocator | `Backstop`, `IBackstop`, `PricerOracle`, `Allocator` | 1,023 |
+| H. Backstop and Allocator | `Backstop`, `IBackstop`, `PricerOracle`, `Allocator` | 1,245 |
 | I. Measured depth | `DepthSampler`, `ImdDepth` | 405 |
 
 **Round 2: later modules (2,195 nSLOC)**
@@ -145,8 +154,9 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
 ## Trust model
 
 - **Governor:** a 2-of-3 Safe, immutable in each contract. It acts only through the 48-hour timelocks of `Parameters`,
-  `Treasury` and `Allocator`, except instant risk-reducing actions (lowering a line, a cap, a keeper cap, a depth
-  ceiling, a bucket; disabling a sleeve listing; unfreezing the Allocator). It cannot move user collateral or
+  `Treasury` and `Allocator`, except instant actions: the risk-reducing ones (lowering a line, a cap, a keeper cap, a
+  depth ceiling, a bucket; disabling a sleeve listing; freezing the Allocator), unfreezing the Allocator, and
+  `Allocator.returnToTreasury` (funds held there back to the Treasury, no bucket). It cannot move user collateral or
   mint imdUSD directly. It can name one bridge minter, once, through the 48-hour timelock (`SET_BRIDGE`): that minter
   can mint without limit and burn from any holder. The beta leaves the slot empty.
 - **Swarm attester:** swarm-priced feeds (sIMD legs, NHI, seat median and spot, the depth leg) accept an EIP-712
@@ -156,14 +166,17 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
   on chain checks the sIMD pair against the market (see Known issues).
 - **Chainlink:** aggregators are trusted within staleness bounds; answers at the aggregator's min/max clamp or above a
   sanity cap read as unpriced.
-- **Keeper role:** a key the governor adds to the `Allocator` through its timelock. It CAN move protocol funds held by
-  the Allocator between the Allocator and allowlisted protocol targets only (ERC-4626 vaults, the peg hook's buffer,
-  `PegLPVault`, allowlisted swap routes back to the Allocator, Backstop collateral sales whose proceeds go straight to
-  the sleeve, and back to the Treasury), each within its refilling bucket and a two-feed slippage bound. It CANNOT name a
-  recipient, raise a bucket or add a target, move user funds, mint imdUSD or change any parameter. A separate FREEZER
-  (guardian) key can only `freeze()` the Allocator and remove keepers; the governor can drop the freezer at once. The
-  same operator also runs permissionless chores anyone may run: relaying attestations, sampling `DepthSampler`, poking
-  `ImdDepth`, marking and liquidating.
+- **Allocator callers:** the rule-driven actions are open to anyone; a caller picks only the MOMENT. Every action draws on
+  the same Safe-set targets and refilling buckets, so a bucket is the most an action can move in its window. Rule-driven
+  calls emit `Ruled` (and `AuctionStarted` / `Bought`); `Acted` is emitted only for a keeper's or the governor's action.
+- **Keeper role:** a key the governor may add to the `Allocator` through its timelock (THE BETA ADDS NONE). It CAN move
+  protocol funds held by the Allocator between the Allocator and allowlisted protocol targets only, each within its bucket
+  and a two-feed slippage bound; it CANNOT name a recipient, raise a bucket or add a target, move user funds, mint imdUSD
+  or change any parameter.
+- **Freezer:** the Safe, from genesis (there is no separate freezer key). `freeze()` stops every keeper and rule-driven
+  Allocator action; only the governor unfreezes. An operator watches the Allocator's logs and alerts; it holds no key that
+  can move or stop protocol funds. Permissionless chores (relaying attestations, sampling `DepthSampler`, poking
+  `ImdDepth`, marking and liquidating, starting auctions) anyone may run.
 - **Issuers:** USDC/USDT can blacklist addresses; stock tokens (round 2) carry issuer pause, blocklist and `adminBurn`
   keys that the protocol cannot prevent, only cap by debt lines.
 - **Relayers and samplers:** permissionless; liveness of swarm-priced types depends on someone buying and relaying
@@ -182,10 +195,7 @@ Items below are known and do not need to be reported unless you find a materiall
 - The sIMD live (redemption payout) leg can be pushed down toward the attested `high` inside a transaction.
 - Seat prices rely on the oracle recipe's distinct-seat rule against wash trading; stronger buyer filters are an
   oracle-side change. When the median's fall cap binds, a seat auction's decay does not continue down to the raw spot.
-- `SET_DEPTH` and `SET_MIGRATOR_LINE` payloads are not decoded at `propose`; a malformed proposal blocks the slot until
-  cancelled. `setGenesisKeeper` does not check the keeper's stable token. (changed: slots are per kind now, so a
-  malformed proposal blocks only its own kind.)
-- `Treasury.retireReserve` is permissionless and does not check outstanding bad debt.
+- `setGenesisKeeper` does not check the keeper's stable token.
 - One wei of sIMD sent to the shared `Join` in a block makes that block's `viaAsset` unwraps revert (sIMD's one-block
   hold); matters mainly once `LoopVault` is on.
 - While a price is stale, borrowing up to the line can use the last attested `low` (bounded by the per-epoch cap).
@@ -267,11 +277,20 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
 
 **Measured depth**
 
-- **Depth griefing.** Four separate-call sandwiches in four different hours of one UTC day still lower the measured
-  depth, for about 8 days (the 4th-lowest bucket and 4th-lowest hour must both be moved). Measured: a 25% push costs
-  about $9,998 of IMD (depth 61,954 to 45,251, sIMD line 21,636 to 10,500); a 50% push about $22,403 (depth 36,648, line
-  4,765). It can only lower the sIMD line. The samplers use the live pool price x ETH/USD as their band reference, not
-  an attested leg (attested legs are bought on demand and are stale most hours, and a sampler refuses a stale feed).
+- **Depth griefing (cost corrected after the first public audit).** A push, a sample and the push back fit in one
+  transaction (between two PoolManager unlocks) or one bundle, so no capital is held: the cost is the pool fee both ways
+  plus gas, about 2% of the pushed notional (~$200 per hour for a 25% push at this snapshot's depth, ~$450 for 50%; the
+  earlier "$9,998" was the IMD sold, which the attacker buys back). Four such hours in one UTC day lower the measured
+  depth for about 8 days (depth 61,954 to 45,251 and sIMD line 21,636 to 10,500 at 25%; depth 36,648 and line 4,765 at
+  50%). It can only lower the sIMD line; positions are untouched. The samplers use the live pool price x ETH/USD as their
+  band reference (an attested reference would need an IMD price at most 1 hour old at every sample). Sampler 0 references
+  its own pool (0xb07d), so its `maxDeviationTicks` guard is inert; samplers 1 and 2 are measured against 0xb07d's price,
+  so a large push of 0xb07d makes them refuse `PoolOffReference` rather than deflate. A public sample can also be sandwiched
+  to INFLATE a bucket (+L / sample / -L); the operator samples through private relays, an operational defence, not the
+  contract's. A fix needs a reference a push cannot move (an attested leg, or a proven end-of-previous-block pool price).
+- **Keeper outage closes new sIMD borrowing.** If no sampler is sampled for about 6 hours of a 26-hour window, it reads 0
+  depth and the 7-day low holds new sIMD borrowing at 0 for about 8 days. Existing positions are untouched. Fail-closed by
+  design.
 
 **PEG positions**
 
@@ -299,6 +318,59 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
 - `RateManager.maxStep` limits the target per call, not a member's move: calls with no ids can walk the target across the
   whole range, then one call moves members by the full range.
 - A 3-word `RETIRE_SLEEVE_TOKEN` payload passes `propose` and fails at apply; its slot holds until the governor cancels.
+
+### Known issues added after the first public audit (wave 1, 2875ffb)
+
+- **Seat swap during an auction.** A holder's seats are fungible: a borrower whose position is in auction can swap the
+  pledged seat for another seat in the same block, and `take` delivers whichever seats remain. Seats are priced by the
+  collection median, so the buyer pays the median-based price for any seat; trait premiums are not priced.
+- **Peg TWAP one-block push.** One block with a pushed peg-pool price holds the Allocator's LP actions (spot more than 10
+  ticks off the TWAP, keeper and rule-driven alike) and can hold `LoopVault.lever` for about 30 minutes. Griefing only.
+- **Peg toll pricing.** The toll is priced on the swap's end price: splitting a push into several swaps pays about a third
+  of the toll; a swap that overshoots $1 is tolled on its whole amount; exact-output swaps pay about 4% less at the cap.
+- **Backstop conversion moment.** A matured deposit bucket converts at the asset value of the first call after it matures
+  (00:00 UTC of day + 2); anyone may call `realize` first.
+- **Rate floor 0 + `borrowFor`.** `borrowFor` passes rate 0; on a type with `rateFloor` 0 a borrow on a position whose debt
+  reached zero before inclusion would open at 0%. Unreachable in the beta (every floor >= 0.5%).
+- **First swarm-feed value.** Nothing on chain checks a leaf's first relayed value; seeding and checking it is the
+  operator's duty.
+- **Edge bootstrap renewal.** The Safe can renew an edge type's 60-day bootstrap allowance by disabling it (instant) and
+  re-listing it (48 h); while disabled, borrowing and the standing bid on it are off.
+- **Redemptions ignore the Pulse.** A redemption can run inside a sequencer grace that holds liquidations (Robinhood chain
+  only; mainnet has no Pulse).
+- **Flash cap is per loan in flight, not per transaction.** Sequential flash loans in one transaction each get the full
+  cap; `circulating()` stays correct.
+- **`circulating()` and flash loans.** Inside a native flash loan it reads at least the supply when the outermost loan
+  began, so real burns inside the loan (a redemption split in chunks) also read against that supply: second order. The
+  fix covers imdUSD's own flash mint only: imdUSD borrowed elsewhere to repay one's own debt, redeem and re-borrow still
+  deflates the supply for the redemption, bounded by outside imdUSD liquidity, the upfront fee and the 5% fee cap.
+- **The seat figure cap counts attestations, not time.** Each new attestation moves the figure at most -20% / +25% + 1;
+  back-to-back attestations (one block apart, each poked) walk it further within minutes, as the median's cap does.
+- **The PEG type on a deploy resume.** A resumed stage adopts PEG's registered pieces without comparing its risk, spot leg
+  or peg aggregator with the config (the other types are compared).
+- **Rule-driven Allocator actions (new since 2875ffb).** A caller picks the moment of each, and where rules share a token
+  (the buffer's quote token, the LP vault's tokens and an auto vault's asset can all be USDC) which rule spends it first;
+  value only moves between protocol addresses. The collateral auction's top is 103% of the sleeve's highest price
+  (`max(low, high, payout)`; the payout follows the type's live pool), its floor 98% of `low`: a type with no live pool
+  leg tops at its attested `high`, so in a rally the pair has not caught up with a buyer can pay under market. Anyone may
+  restart a run once it reaches its floor (griefing: up to 2 hours per restart before the floor again).
+  `rebalanceVault` deposits at the vault's share price of that moment: only rate-based vaults (sUSDS-like) are meant for
+  it; changing the auto vault leaves the old vault's shares to a keeper or the Safe. `rebalanceLp` exits with zero
+  minimums behind the spot-versus-TWAP gate. Each is bounded by its bucket, and `freeze()` (the Safe) stops all of them.
+
+### What changed since the first public audit (2875ffb)
+
+For the re-check: the second commit of this repository is the whole delta. Fixes: health and liquidation on the
+post-harvest state; `circulating()` held at the outermost flash loan's start; the seat auction clock counts from
+max(signed, relayed); the seat figure capped per attestation and `SeatFeed` priced 0 until its first poke; deploy resume
+compares every kept piece with the config; USDC/USDS feeds 25 h; malformed BATCH items refused at propose; seat-sale bad
+debt covered in the same transaction; bounded way-back and remote clock in `SwarmFeed`; `RateFeed` high-water; instant
+lowers that could raise refused; the way back after a silence bounded by 2x the cap from the last value as well as the
+cap from the level (bounding it to values between the two instead locked out an honest fall for two hours); `Backstop.deposit` for others only into today's slot; `payNote` waits while bad debt is
+booked and `retireReserve` keeps notes' face; ledger premium and risk-version lows; `SET_KEEPER`/`SET_BRIDGE` and a full
+sleeve refused at propose; `SeatAccount.sync` refuses the seat and its join; two more approval selectors denied. New: the
+rule-driven Allocator actions and the Safe as freezer from genesis. Each fix has a test named `AuditW1*` (the auditors'
+proofs, adapted) or sits in the existing suites.
 
 ## Reporting findings
 

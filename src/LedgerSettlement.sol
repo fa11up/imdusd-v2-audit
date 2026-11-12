@@ -117,10 +117,13 @@ contract LedgerSettlement is LedgerBase {
         Position storage p = _positions[id];
         IlkState storage s = ilkState[ilk];
         _accrue(ilk, s);
-        uint256 debt = _debtOf(p);
+        Pricer.Quote memory q = pricer.quote(ilk);
+        // The pending harvest lands first (audit wave 1, panel 1): the Liquidator judged health on the harvested state
+        // (Ledger.healthy), so the position is settled in the state it was judged in.
+        uint256 debt = _harvest(ilk, id, c, r, q, s, p, _debtOf(p));
         if (debt == 0) revert NoDebt();
-        // The position's bound version sets the penalty and the target (mat), not the type's newest.
-        (uint256 vMat, uint256 vChop) = _liq(ilk, p, pricer.quote(ilk).mat);
+        // the position's bound version sets the penalty and the target (mat), not the type's newest.
+        (uint256 vMat, uint256 vChop) = _liq(ilk, p, q.mat);
         r.chop = uint64(vChop);
         // SOLVENCY BEFORE PENALTY. The collateral's worth repays the debt FIRST; the penalty (and the
         // Treasury's and marker's cuts of it) comes only from what is left, and bad debt is booked only when the
@@ -239,6 +242,59 @@ contract LedgerSettlement is LedgerBase {
         if (c.redeemable) _relist(ilk, id, true, false, false, 0, 0);
         if (seized != 0) Join(c.join).exit(treasury, seized);
         emit Liquidated(id, ilk, 0, seized, debt);
+    }
+
+
+    /// @notice Change a position's rate (its owner, or an operator with SET_RATE). A change within RATE_COOLDOWN of the last
+    /// (either direction, C4) adds RATE_COOLDOWN of interest at the old rate to the debt (minted as interest); after the
+    /// cooldown it is free.
+    function setRate(uint256 id, uint64 newRate, uint256 prevHint, uint256 nextHint)
+        external
+        onlyLedger
+        nonReentrant // the Ledger's own lock slot (delegatecall)
+    {
+        bytes32 ilk = _ilkOf(id);
+        if (msg.sender != nft.ownerOf(id)) nft.checkRights(id, msg.sender, RIGHT_SET_RATE);
+        ParametersBase.Config memory c = _config(ilk);
+        ParametersBase.Risk memory r = params.storedRisk(ilk);
+        if (newRate < r.rateFloor || newRate > MAX_RATE) revert RateOutOfRange();
+        Pricer.Quote memory q = _quote(ilk);
+        Position storage p = _positions[id];
+        IlkState storage s = ilkState[ilk];
+        _accrue(ilk, s);
+        uint256 oldDebt = p.debt;
+        uint256 oldRate = p.rate;
+        uint256 debt = _harvest(ilk, id, c, r, q, s, p, _debtOf(p));
+        if (debt == 0) revert NoDebt();
+        uint256 premium;
+        bool inCooldown = block.timestamp < p.lastRateChange + RATE_COOLDOWN;
+        if (newRate != oldRate && inCooldown) {
+            // only the owner may pay a cooldown premium; SET_RATE alone must not be able to add debt.
+            if (msg.sender != nft.ownerOf(id)) revert NotOwner(); // re-read: a local here is one stack slot too many for solc
+            premium = _premium(debt, oldRate);
+            debt += premium;
+            s.debt += premium.toUint128();
+            // The premium is new debt: the live line binds it (a lowered or depth-closed line stops in-cooldown changes
+            // too: a documented effect, audit wave 1) and so does the unbacked brake (audit wave 1: it was not checked).
+            // a rate change is not a borrow, so the borrow-price cap does not measure it.
+            if (uint256(s.debt) + s.badDebt > params.risk(ilk).line) revert CeilingExceeded(); // `r` is the stored risk: the depth rule binds here
+            _checkBrake();
+            _checkLines(ilk);
+            _checkEdge(ilk);
+            _mintInterest(ilk, premium);
+            if (!q.borrowable || !q.agree) revert NotPriced(); // a pair above the pool is not a price to add debt at
+            if (!_healthy(p.collateral, debt, q.low, q.mat)) revert Unhealthy();
+            p.version = uint32(params.riskVersion(ilk)); // a risk-increasing action rebinds to the newest version
+        }
+        // A charged change leaves its old rate for top-ups inside the new cooldown; a free one leaves none. A chain of
+        // changes inside one cooldown keeps the rate before the FIRST (audit wave 1: two changes on a dust debt set it to
+        // any rate the owner chose, and the top-up premium was paid at that).
+        if (newRate != oldRate) p.premiumRate = inCooldown ? (p.premiumRate != 0 ? p.premiumRate : uint64(oldRate)) : 0;
+        else if (!inCooldown) p.premiumRate = 0; // the clock restarts below: a lapsed premium must not come back with it
+        p.lastRateChange = uint64(block.timestamp);
+        _record(s, p, oldDebt, oldRate, debt, newRate);
+        if (c.redeemable) _relist(ilk, id, true, true, true, prevHint, nextHint);
+        emit RateSet(id, ilk, newRate, premium);
     }
 
 }

@@ -124,7 +124,10 @@ abstract contract LedgerBase is TransientReentrancyGuard {
     /// upfront fee, and raise-ahead-of-a-redemption would be free). Debt added inside the cooldown pays the
     /// same on the added amount at `premiumRate` (the rate before the change), so a dust reopen followed by a top-up
     /// costs what one reopen does. A position's rate and `lastRateChange` survive a repayment (or redemption) to
-    /// zero, so reopening at another rate inside the cooldown pays the premium (a flash mint cannot launder a rate drop).
+    /// zero, so reopening the SAME id at another rate inside the cooldown pays the premium (a flash mint cannot launder a
+    /// rate drop on that id). A fresh id (another salt) starts with no cooldown: moving the collateral there and borrowing
+    /// at a lower rate pays only the upfront fee, 7 days at the type's average rate, which on a type with no other debt
+    /// is the borrower's own new rate.
     uint256 public constant RATE_COOLDOWN = 7 days;
     /// @notice `writeOff` needs the custody worthless at two readings this far apart, the first no older than the window:
     /// an issuer's burn-then-reissue inside an hour writes nothing off. 1 h = a keeper's polling horizon and well
@@ -290,7 +293,7 @@ abstract contract LedgerBase is TransientReentrancyGuard {
             uint256 toEdge = Math.min(Math.mulDiv(amount, params.edgePremium(), 1e18), amount - toSavings);
             if (toEdge != 0) {
                 token.mint(edge, toEdge);
-                IEdgeSleeve(edge).sync(); // streams over 7 days; a no-op inside an open bid (closeBid counts it then)
+                IEdgeSleeve(edge).sync(); // streams over 7 days; a no-op inside an open bid (the next sync() streams it)
                 toSavings += toEdge; // so the Treasury gets the rest
             }
         }
@@ -368,10 +371,7 @@ abstract contract LedgerBase is TransientReentrancyGuard {
             return debt;
         }
         if (!q.priced) return debt; // keep the mark: harvest later at a trustworthy price
-        uint256 yieldShares = Math.mulDiv(p.collateral, rateNow - mark, rateNow);
-        uint256 net = Math.mulDiv(Math.mulDiv(yieldShares, q.low, 1e18), 1e18 - r.yieldFee, 1e18);
-        uint256 credit = Math.min(net, debt);
-        uint256 taken = credit == net ? yieldShares : Math.mulDiv(yieldShares, credit, net, Math.Rounding.Ceil);
+        (uint256 taken, uint256 credit) = _yieldTake(p.collateral, mark, rateNow, q.low, r.yieldFee, debt);
         p.yieldMark = uint192(rateNow);
         if (credit == 0) return debt;
         p.collateral -= taken.toUint128();
@@ -381,6 +381,39 @@ abstract contract LedgerBase is TransientReentrancyGuard {
         Join(c.join).exit(treasury, taken);
         emit Harvested(id, ilk, taken, credit);
         return debt - credit;
+    }
+
+    /// @dev The harvest's arithmetic: the yield shares since `mark` leave (`taken`) and (1 - fee) of their worth at `price`
+    /// pays the debt (`credit`, at most `debt`; only the shares that pay it leave when it binds).
+    function _yieldTake(uint256 collateral, uint256 mark, uint256 rateNow, uint256 price, uint256 fee, uint256 debt)
+        internal
+        pure
+        returns (uint256 taken, uint256 credit)
+    {
+        uint256 yieldShares = Math.mulDiv(collateral, rateNow - mark, rateNow);
+        uint256 net = Math.mulDiv(Math.mulDiv(yieldShares, price, 1e18), 1e18 - fee, 1e18);
+        credit = Math.min(net, debt);
+        taken = credit == net ? yieldShares : Math.mulDiv(yieldShares, credit, net, Math.Rounding.Ceil);
+    }
+
+    /// @dev Collateral and debt as `_harvest` would leave them now (a view twin; same skips). Liquidation health is measured
+    /// on this state (audit wave 1, panel 1): otherwise a third party's harvest could turn a healthy position liquidatable at an
+    /// unchanged price (below 1/(1 - yieldFee) the fee lowers the ratio), and a position its own harvest heals could be
+    /// liquidated by a keeper that simply does not harvest.
+    function _afterHarvest(ParametersBase.Config memory c, uint256 yieldFee, Pricer.Quote memory q, Position storage p)
+        internal
+        view
+        returns (uint256 collateral, uint256 debt)
+    {
+        collateral = p.collateral;
+        debt = _debtOf(p);
+        if (c.yieldRate == address(0) || !q.priced || debt == 0 || collateral == 0) return (collateral, debt);
+        uint256 rateNow = IRateSource(c.yieldRate).rate();
+        uint256 mark = p.yieldMark;
+        if (rateNow == 0 || mark == 0 || rateNow <= mark) return (collateral, debt);
+        (uint256 taken, uint256 credit) = _yieldTake(collateral, mark, rateNow, q.low, yieldFee, debt);
+        if (credit == 0) return (collateral, debt);
+        return (collateral - taken, debt - credit);
     }
 
     /// @dev A deposit while the mark lags the rate (harvest skipped because unpriced) must not let the new

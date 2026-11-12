@@ -42,11 +42,13 @@ interface IPegHookView {
 /// vault holds (position at the current price + idle balances), so no price is ever used to value a share. A single-
 /// asset 4626 wrapper (with a zap) can sit on top later for integrations.
 ///
-/// MANIPULATION. A proportional deposit made while the pool is pushed away from its true price buys shares at a
-/// discount (the position's loss at the pushed price) that the attacker recovers when the price returns. So deposits
-/// (and `compound`) require the spot to be within MAX_SPOT_TWAP_TICKS of the peg hook's 30-minute TWAP; a push large
-/// enough to matter also pays the hook's surcharge beyond ±0.25%. Withdrawals are never gated: a withdrawal at a
-/// pushed price only receives less, and an exit must always be open. Callers bound both with min/max amounts.
+/// MANIPULATION. Valued at $1 a token, a band position is worth least at $1 and more either side of it (at the beta's
+/// ±100-tick band: about +0.06% at 50 ticks, +0.25% at the edge): a push sells the position tokens at off-$1 prices, and
+/// the pusher pays for that. So a proportional deposit at a pushed price pays a small premium, and a withdrawal at a
+/// pushed price receives a little more, out of the pusher's loss. Deposits (and `compound`) still require the spot to be
+/// within MAX_SPOT_TWAP_TICKS of the peg hook's 30-minute TWAP, which keeps entries at a price near the market's; a push
+/// large enough to matter also pays the hook's surcharge beyond ±0.25%. Withdrawals are never gated: an exit must always
+/// be open. Callers bound both with min/max amounts.
 ///
 /// THE BAND IS FIXED. A peg LP's job is to be at $1. If imdUSD leaves the band the position is all one asset by design:
 /// below $0.99 it has bought imdUSD all the way down (the peg's buyer), above $1.01 it has sold it. It is not moved to

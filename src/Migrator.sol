@@ -10,8 +10,9 @@ import {Parameters} from "./Parameters.sol";
 /// @notice imdUSD v1 <-> imdUSD, 1:1, no fee.
 /// @dev v1's token has a permanent minter (its own vault), so v2 cannot mint v1; this is how one unit
 /// circulates instead of two. `toV2` is capped by `Parameters.migratorLine` because every v1 it holds is
-/// v1's own vault's risk carried into v2; `toV1` is never blocked while it holds v1. The count is kept
-/// here rather than read from the v1 balance, so a donation of v1 cannot create mint room.
+/// v1's own vault's risk carried into v2; `toV1` is bounded by `outstanding` (the v1 taken in through `toV2`), never by
+/// the line, and never by donated v1. The count is kept here rather than read from the v1 balance, so a donation of v1
+/// cannot create mint or burn room.
 contract Migrator is TransientReentrancyGuard {
     using SafeERC20 for IERC20;
 

@@ -7,6 +7,8 @@ import "./ParametersBase.sol";
 /// by Parameters' constructor and run ONLY by delegatecall from it, on Parameters' storage; a direct call is refused.
 contract ParametersRules is ParametersBase {
     address private immutable self;
+    uint256 internal constant SLEEVE_MAX_TOKENS = 6; // Backstop.MAX_TOKENS
+    uint256 internal constant SLEEVE_MAX_ILKS = 12; // Backstop.MAX_ILKS
 
     error NotDelegated();
 
@@ -37,10 +39,14 @@ contract ParametersRules is ParametersBase {
             (, bytes32 ilk, Config memory c, Risk memory r) = abi.decode(payload, (uint8, bytes32, Config, Risk));
             _checkIlk(ilk, c, r);
         } else if (kind == SET_MIGRATOR_LINE) {
-            // Any value: zero closes conversion into v2; reverse conversion is never blocked by the line.
+            // Any value: zero closes conversion into v2; reverse conversion is never blocked by the line. Decoded here so a
+            // malformed payload is refused at propose (audit wave 1: inside a BATCH it made every instant lower revert).
+            abi.decode(payload, (uint8, uint256));
         } else if (kind == SET_BRIDGE || kind == SET_KEEPER) {
             (, address minter) = abi.decode(payload, (uint8, address));
-            if (minter.code.length == 0) revert BadConfig();
+            // Audit wave 1: ImdUSD names each minter once (AlreadySet), so a second proposal could never apply.
+            IBridgeSettable t = IBridgeSettable(token);
+            if (minter.code.length == 0 || (kind == SET_BRIDGE ? t.bridge() : t.keeper()) != address(0)) revert BadConfig();
         } else if (kind == SET_SAVINGS_SHARE) {
             (, uint64 share) = abi.decode(payload, (uint8, uint64));
             if (savings == address(0) || share > MAX_SAVINGS_SHARE) revert OutOfBounds();
@@ -64,6 +70,7 @@ contract ParametersRules is ParametersBase {
             (, uint64 k) = abi.decode(payload, (uint8, uint64));
             if (depthIlk == bytes32(0) || k > MAX_DEPTH_K) revert OutOfBounds();
         } else if (kind == SET_DEPTH) {
+            abi.decode(payload, (uint8, uint256)); // refused at propose if malformed (as SET_MIGRATOR_LINE)
             if (depthIlk == bytes32(0)) revert OutOfBounds();
         } else if (kind == ADD_DEPTH_SAMPLER) {
             (, address sampler) = abi.decode(payload, (uint8, address));
@@ -98,13 +105,13 @@ contract ParametersRules is ParametersBase {
                 (address o,,,) = ISleeve(other).ilks(ilk);
                 if (o != address(0)) revert BadConfig();
             }
-            // Refuse at propose (and again at apply) what the apply would fail on or harm with: a NEW token in a
-            // sleeve already holding MAX_TOKENS, a token the sleeve's oracle maps to another type, and an edge listing
-            // whose existing debt would push the summed edge debt past what the edge sleeve stands behind (that would
-            // stop borrowing on every edge type at once).
-            if (!ISleeve(sleeve).isToken(c.token) && ISleeve(sleeve).tokenCount() >= ISleeve(sleeve).MAX_TOKENS()) {
-                revert OutOfBounds();
-            }
+            // refuse at propose (and again at apply) what the apply would fail on or harm with: a NEW token in a
+            // sleeve already holding MAX_TOKENS, a NEW type in a sleeve already listing MAX_ILKS, a token the sleeve's oracle
+            // maps to another type, and an edge listing whose existing debt would push the summed edge debt past what the
+            // edge sleeve stands behind (that would stop borrowing on every edge type at once). The limits are Backstop's
+            // constants, written out to save code size (a test pins them to Backstop.MAX_TOKENS / MAX_ILKS).
+            if (!ISleeve(sleeve).isToken(c.token) && ISleeve(sleeve).tokenCount() >= SLEEVE_MAX_TOKENS) revert OutOfBounds();
+            if (listed == address(0) && ISleeve(sleeve).ilkCount() >= SLEEVE_MAX_ILKS) revert OutOfBounds();
             bytes32 mapped = ISleeveOracle(ISleeve(sleeve).oracle()).ilkOf(c.token);
             if (mapped != bytes32(0) && mapped != ilk) revert BadConfig();
             if (edge) _checkEdgeListing(sleeve, ilk, genesisLine);
@@ -222,6 +229,8 @@ contract ParametersRules is ParametersBase {
             || s == 0xd505accf // permit(address,address,uint256,uint256,uint8,bytes32,bytes32) (EIP-2612)
             || s == 0x8fcbaf0c // permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32) (DAI)
             || s == 0x39509351 // increaseAllowance(address,uint256)
+            || s == 0xd73dd623 // increaseApproval(address,uint256) (older Zeppelin tokens)
+            || s == 0x87517c45 // approve(address,address,uint160,uint48) (Permit2)
             || s == 0xa22cb465 // setApprovalForAll(address,bool)
             || s == 0x42842e0e // safeTransferFrom(address,address,uint256)
             || s == 0xb88d4fde // safeTransferFrom(address,address,uint256,bytes)

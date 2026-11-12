@@ -40,9 +40,9 @@ contract Pricer {
         bool borrowable; // priced, legs agree, not depegged: new debt and withdrawals may use it
         uint256 borrow; // min(low, Parameters.cap): the price new debt and withdrawals are measured at
         /// priced, the spot leg fresh and within `skew` of the median, and (a type with a live leg) the live pool fresh and
-        /// not below `low` by more than `skew`. The standing bid reads it, and a charged rate change
-        /// : failing it sends a liquidation to the caller path, so pushing the pool away can only make the sleeve stand
-        /// aside. `borrowable` and `low` do not read the live leg.
+        /// not below `low` by more than `skew`. Two readers: the standing bid (failing it sends a liquidation to the
+        /// caller path, so pushing the pool away can only make the sleeve stand aside), and a charged rate change, which needs
+        /// both `borrowable` and `agree`. `borrowable` and `low` do not read the live leg.
         bool agree;
     }
 

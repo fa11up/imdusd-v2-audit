@@ -15,6 +15,11 @@ import {SeatFeed} from "../feeds/SeatFeed.sol";
 import {SeatAccount, IImdAgentAdapter} from "./SeatAccount.sol";
 import {IHolderJoin, IAuctionJoin} from "../interfaces/IPositions.sol";
 
+/// @dev The median leaf's relay time (SwarmFeed.acceptedAt): when the chain first held the live attestation.
+interface IRelayedAt {
+    function acceptedAt() external view returns (uint64);
+}
+
 interface IDistributorFactory {
     function distributorOf(uint64 launchNumber) external view returns (address);
 }
@@ -30,8 +35,8 @@ interface IDistributorFactory {
 /// burns 1e18 units for any one of their seats, and a sale takes the position's n seats from their list.
 /// Invariant: every holder's units in wallet + in the Ledger == 1e18 x the seats held for them.
 ///
-/// SALE. `Liquidator.bite` opens a Dutch auction: the raw 7-day median, decaying to
-/// AUCTION_FLOOR x median over AUCTION_TIME. `take` pays n x price in imdUSD; the Ledger (through
+/// SALE. `Liquidator.bite` opens a Dutch auction at the fall-capped 7-day median
+/// (`SeatFeed.medianUsd`), decaying to AUCTION_FLOOR x that start over AUCTION_TIME. `take` pays n x price in imdUSD; the Ledger (through
 /// `Liquidator.settle`) burns the debt from it and seizes every unit; the penalty's chip goes to the
 /// marker and the rest of the penalty to the Treasury (the taker's reward is the discount, so the
 /// liquidator share is not paid twice); anything above debt + penalty goes back to the borrower; the
@@ -456,6 +461,9 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
     /// the clock only ever runs slow, never fast (a slower decay, a longer life), and a `tick` after each
     /// relay makes it exact. The ETH/USD leg's own staleness blocks a sale (`NotPriced`) but is not
     /// reconstructed here.
+    /// The new attestation's window opens when the chain first held it, max(signed, relayed), not at its signature
+    /// (audit wave 1, panel 6): one signed before the old window closed but relayed after it, or signed in the gap and relayed
+    /// later, must not count the hours the chain read stale (when `take` refused `NotPriced`) as priced time.
     function _elapsed(Auction memory a) private view returns (uint256 ran) {
         ran = a.ran;
         IFeed m = _feed().median();
@@ -464,16 +472,17 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
         uint256 t = block.timestamp;
         uint256 from = a.lastTick;
         uint256 freshUntil = uint256(a.attestedAt) + life;
-        if (newAt <= freshUntil) {
-            // The current attestation (the same one, or a refresh before the old one aged out): fresh
+        uint256 opened = Math.max(uint256(newAt), uint256(IRelayedAt(address(m)).acceptedAt()));
+        if (opened <= freshUntil) {
+            // The current attestation (the same one, or a refresh relayed before the old one aged out): fresh
             // without a gap until the newest window closes.
             uint256 end = Math.min(t, Math.max(freshUntil, uint256(newAt) + life));
             if (end > from) ran += end - from;
         } else {
-            // A gap: the old window closed before the new attestation landed.
+            // A gap: the old window closed before the new attestation reached the chain.
             uint256 end1 = Math.min(t, freshUntil);
             if (end1 > from) ran += end1 - from;
-            uint256 from2 = Math.max(from, uint256(newAt));
+            uint256 from2 = Math.max(from, opened);
             uint256 end2 = Math.min(t, uint256(newAt) + life);
             if (end2 > from2) ran += end2 - from2;
         }
@@ -613,7 +622,8 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
     }
 
     /// @notice A seat's account reports an arrival: credited to the seat's holder now, or, between holders,
-    /// to the last one (the operator who earned it); a seat that never had one credits the Treasury.
+    /// to the last one (S4); a seat that never had one credits the Treasury. Credit follows the holder when the arrival is
+    /// REPORTED, not when it was earned: arrivals left unreported at a change of holder go to the next holder who reports.
     function onRewards(uint256 tokenId, address token, uint256 amount) external {
         if (msg.sender != accountOf(tokenId)) revert NotSeatAccount();
         address who = holderOf[tokenId];

@@ -13,7 +13,9 @@ import {IBackstop, IBackstopOracle, ILedgerCover, IBackstopSeller} from "./IBack
 /// @notice Depositors pool imdUSD. When a covered type's position is liquidated, the sleeve is the payer: it buys the
 /// collateral in the liquidation's own transaction at the liquidation price plus the type's penalty, so the
 /// liquidation's value goes to depositors and the kicker earns only the marker's chip. Two instances of this contract
-/// exist per chain: `blue` (ETH, BTC, staked stables) and `edge` (sIMD, seats, stocks). The edge sleeve also burns its
+/// exist per chain: `blue` (ETH, BTC, staked stables) and `edge` (sIMD, and later fungible edge types). Seat and stock
+/// types sell by Dutch auction: no sleeve can list them (ADD_SLEEVE_ILK refuses an auction type), so they have no standing
+/// bid and no first loss, and their bad debt goes to the Treasury. The edge sleeve also burns its
 /// imdUSD against edge types' bad debt before the Treasury does (`coverBadDebt`), earns a premium (a share of edge
 /// interest, minted here by the Ledger and streamed), and bounds edge lines (`edgeCapacity`).
 ///
@@ -223,7 +225,9 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
 
     /// @notice List a type: the deployer before `seal`, then only Parameters. `genesisLine` is the edge bootstrap
     /// allowance (ignored on the blue sleeve). The sale limit bounds the seller per collateral token. A type disabled
-    /// earlier may be listed again with the same token (disabling is not final); its listing restarts.
+    /// earlier may be listed again with the same token (disabling is not final); its listing restarts, `listedAt`
+    /// and `genesisLine` included, so a re-listing opens a fresh 60-day bootstrap allowance (a governance power: the
+    /// Safe's instant disable plus a 48h ADD_SLEEVE_ILK can keep edge capacity above what vested imdUSD supports).
     function addIlk(bytes32 ilk, address token, uint128 genesisLine, uint128 saleMax, uint128 saleSlope) external {
         if (isSealed ? msg.sender != params : msg.sender != deployer) revert Unauthorized();
         Ilk storage k = ilks[ilk];
@@ -386,6 +390,10 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
         return tokens.length;
     }
 
+    function ilkCount() external view returns (uint256) {
+        return ilkList.length;
+    }
+
     function openDaysLength() external view returns (uint256) {
         return openDays.length;
     }
@@ -393,7 +401,8 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
     // ================================================================ deposits
 
     /// @notice Deposit imdUSD for `to`. It waits in today's bucket and becomes shares from the start of the day after
-    /// tomorrow (at least one full day), at the asset value then.
+    /// tomorrow (at least one full day), at the asset value then. A deposit for someone else may only add to their slot of
+    /// today (audit wave 1: two wei from a stranger could fill both of a user's pending slots and block their deposits).
     function deposit(uint256 amount, address to) external nonReentrant notInBid {
         if (amount == 0) revert ZeroAmount();
         sync();
@@ -414,6 +423,7 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
         Pend[2] storage p = _pend[to];
         if (p[0].day == day && p[0].amount != 0) p[0].amount += a128;
         else if (p[1].day == day && p[1].amount != 0) p[1].amount += a128;
+        else if (to != msg.sender) revert TooManyPending();
         else if (p[0].amount == 0) p[0] = Pend(uint64(day), a128);
         else if (p[1].amount == 0) p[1] = Pend(uint64(day), a128);
         else revert TooManyPending();

@@ -49,6 +49,19 @@ contract PricerOracle is IBackstopOracle {
         }
     }
 
+    /// @notice The redemption payout price of `token`'s type (`Pricer.Quote.payout`: max of the attested `high` and the type's
+    /// live pool leg where it has one); 0 when unmapped or the quote reverts. Read by the Allocator's collateral auction as
+    /// the top of a run, so a market above a lagging attested pair is still asked for. Never used to value or floor a sale.
+    function payoutOf(address token) external view returns (uint256) {
+        bytes32 ilk = ilkOf[token];
+        if (ilk == bytes32(0)) return 0;
+        try pricer.quote(ilk) returns (Pricer.Quote memory q) {
+            return q.payout;
+        } catch {
+            return 0;
+        }
+    }
+
     /// @dev The legs `Pricer.quote` needs for `priced`: the median and any NHI. A leg that reverts reads as never updated.
     function pricedAt(address token) external view returns (uint256 at) {
         bytes32 ilk = ilkOf[token];

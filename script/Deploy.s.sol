@@ -18,14 +18,18 @@ import {StageModules} from "./deploy/StageModules.sol";
 ///   1 core      ImdUSD, Parameters, Pricer, Treasury, Ledger, Redeemer, Liquidator, Migrator + the four wire calls
 ///   2 feeds     every feed node
 ///   3 types     joins + wire + addGenesisIlk (+ seats, stocks, chain line where on) + the migrator line
-///   4 genesis   SavingsVault, FeeNotes, PegHook + peg pool at $1, the genesis setters, `seal()`
+///   4 genesis   SavingsVault, FeeNotes, PegHook + peg pool at $1, PegLPVault, the PEG type, ImdDepth + samplers,
+///               the depth rule, PricerOracle + Backstop sleeves + Allocator, the genesis setters, `seal()`
 ///   (4b bridge  chain configs only: ImdBridge, after the seal)
-///   5 modules   PegLPVault, LoopVault, the Compound DEX (+ its linked libraries)
+///   5 modules   LoopVault, the Compound DEX (+ its linked libraries): the full config only
+///
+/// The numbers in the stage functions' comments (0-7, 5b, 6a, ...) count steps across the whole run, not stages.
 ///
 /// AUTHORITY. The governance Safe is the `governor` of Parameters and Treasury from construction; the
-/// deploying EOA is only ever a `wirer`, and every wirer power is single-use: `wire` once per contract,
-/// genesis types/lines/savings until `seal`. Stage 4 ends with `seal()`, after which the EOA can do
-/// nothing (test/fork/Deploy.t.sol proves each one reverts). No contract has an owner.
+/// deploying EOA is a `wirer`, and the `deployer` of PricerOracle and both Backstop sleeves until each one's own
+/// `seal()`. Every such power is single-use: `wire` once per contract, genesis types/lines/savings until `seal`.
+/// Stage 4 ends with `seal()`, after which the EOA can change nothing (test/fork/Deploy.t.sol proves each
+/// wirer call reverts; PricerOracle.seal and Backstop.seal stay callable by it as no-ops). No contract has an owner.
 ///
 ///   forge script script/Deploy.s.sol --rpc-url $MAINNET_RPC_URL --sender <deployer> --broadcast --verify
 contract Deploy is DeployBase, StageCore, StageFeeds, StageTypes, StageGenesis, StageModules {
@@ -57,7 +61,7 @@ contract Deploy is DeployBase, StageCore, StageFeeds, StageTypes, StageGenesis, 
         _stageTypes(cfg, d, me);
         _stageGenesis(cfg, d);
 
-        // 5b. The LayerZero path. Not yet a minter: the Safe proposes SET_BRIDGE (48h) on Parameters, and opens each
+        // 4b (stage). The LayerZero path. Not yet a minter: the Safe proposes SET_BRIDGE (48h) on Parameters, and opens each
         // path (peer, limits, enforced options, DVN config) on the bridge's own 48h timelock.
         if (cfg.bridge.enabled) {
             uint256 g = gasleft();

@@ -24,8 +24,9 @@ import {PricerOracle} from "../../src/backstop/PricerOracle.sol";
 import {Allocator} from "../../src/peg/Allocator.sol";
 
 /// @notice Stage 4, the genesis modules and the seal: SavingsVault + its share, FeeNotes (wired both ways, dormant),
-/// the PegHook at a mined CREATE2 address with its pool opened at $1 and named the keeper minter, then `seal()`.
-/// After it the deployer holds no power anywhere.
+/// the PegHook at a mined CREATE2 address with its pool opened at $1 and named the keeper minter, PegLPVault, the PEG
+/// type (StagePeg), ImdDepth + its samplers, the depth rule, the standing bid (PricerOracle, Backstop sleeves, Allocator),
+/// then `seal()`. After it the deployer can change nothing (Backstop.seal / PricerOracle.seal stay callable as no-ops).
 abstract contract StageGenesis is StagePeg {
     function _stageGenesis(DeployTypes.Config memory cfg, Deployed memory d) internal {
         uint256 g;
@@ -173,8 +174,9 @@ abstract contract StageGenesis is StagePeg {
             d.backstopOracle = new PricerOracle(d.pricer, address(d.params));
             _rec("PricerOracle", g, type(PricerOracle).creationCode.length + 64);
         }
-        if (!(_has(address(d.allocator)) && _ok(d.allocator.treasury() == address(d.treasury) && d.allocator.governor() == cfg.governor,
-                    "Allocator"))) {
+        // Audit wave 1 (deploy low): every kept piece is compared with what this config would build, not only its wiring.
+        if (!(_has(address(d.allocator)) && _ok(d.allocator.treasury() == address(d.treasury) && d.allocator.governor() == cfg.governor
+                    && d.allocator.freezer() == b.freezer && d.allocator.maxSlippageBps() == b.maxSlippageBps, "Allocator"))) {
             g = gasleft();
             d.allocator = new Allocator(cfg.governor, address(d.treasury), b.freezer, b.maxSlippageBps);
             _rec("Allocator", g, type(Allocator).creationCode.length + 128);
@@ -185,17 +187,25 @@ abstract contract StageGenesis is StagePeg {
             DeployTypes.SleeveIlk memory si = b.ilks[i];
             address token = d.params.config(si.ilk).token;
             if (token == address(0)) revert Mismatch("backstop: type not registered");
-            if (d.backstopOracle.ilkOf(token) == bytes32(0)) {
+            bytes32 mapped = d.backstopOracle.ilkOf(token);
+            if (mapped == bytes32(0)) {
                 g = gasleft();
                 d.backstopOracle.setIlk(token, si.ilk);
                 _rec("backstopOracle.setIlk", g, CALL_DATA);
+            } else if (mapped != si.ilk) {
+                revert Mismatch("PricerOracle maps the token to another type");
             }
             Backstop s = si.edge ? d.edge : d.blue;
-            (address listed,,,) = s.ilks(si.ilk);
+            (address listed,, uint128 genesisLine,) = s.ilks(si.ilk);
             if (listed == address(0)) {
                 g = gasleft();
                 s.addIlk(si.ilk, token, si.genesisLine, si.saleMax, si.saleMax / 1 days);
                 _rec("backstop.addIlk", g, CALL_DATA + 64);
+            } else {
+                (uint128 saleMax,,,) = s.saleLimit(token);
+                if (listed != token || genesisLine != (si.edge ? si.genesisLine : 0) || saleMax != si.saleMax) {
+                    revert Mismatch("sleeve listing from another config");
+                }
             }
         }
         if (!d.backstopOracle.sealed_()) {
@@ -220,6 +230,8 @@ abstract contract StageGenesis is StagePeg {
             _rec("params.setGenesisBackstops", g, CALL_DATA);
         } else if (d.params.blueBackstop() != address(d.blue) || d.params.edgeBackstop() != address(d.edge)) {
             revert Mismatch("Parameters points at other sleeves");
+        } else if (!d.params.sealed_() && d.params.edgePremium() != b.edgePremium) {
+            revert Mismatch("edge premium from another config");
         }
         for (uint256 i; i < b.ilks.length; ++i) {
             if (b.ilks[i].edge && !d.params.edgeIlk(b.ilks[i].ilk)) {
@@ -273,9 +285,9 @@ abstract contract StageGenesis is StagePeg {
                 hooks: IHooks(sp.hooks)
             });
             require(keccak256(abi.encode(key)) == sp.poolId, "depth sampler: key does not hash to its pool id");
-            if (!(_has(address(d.samplers[i])) && _ok(PoolId.unwrap(d.samplers[i].poolId()) == sp.poolId, "DepthSampler"))) {
-                IFeed f0 = sp.feed0 == DeployTypes.NO_FEED ? IFeed(address(0)) : d.feeds[sp.feed0];
-                IFeed f1 = sp.feed1 == DeployTypes.NO_FEED ? IFeed(address(0)) : d.feeds[sp.feed1];
+            IFeed f0 = sp.feed0 == DeployTypes.NO_FEED ? IFeed(address(0)) : d.feeds[sp.feed0];
+            IFeed f1 = sp.feed1 == DeployTypes.NO_FEED ? IFeed(address(0)) : d.feeds[sp.feed1];
+            if (!(_has(address(d.samplers[i])) && _ok(_samplerIs(d.samplers[i], sp, f0, f1, cfg.poolManager), "DepthSampler"))) {
                 g = gasleft();
                 d.samplers[i] = new DepthSampler(
                     IPoolManager(cfg.poolManager), key, f0, f1, sp.bandBps, sp.maxDeviationTicks, sp.maxSteps, sp.soldIsToken0
@@ -289,6 +301,17 @@ abstract contract StageGenesis is StagePeg {
             d.params.setGenesisImdDepth(address(d.imdDepth), list);
             _rec("params.setGenesisImdDepth", g, CALL_DATA + 32 * n);
         }
+    }
+
+    /// @dev A recorded sampler is kept only if it is the one this spec builds (pool, feeds, band, guard, walk bound, side).
+    function _samplerIs(DepthSampler s, DeployTypes.SamplerSpec memory sp, IFeed f0, IFeed f1, address manager)
+        internal
+        view
+        returns (bool)
+    {
+        return PoolId.unwrap(s.poolId()) == sp.poolId && address(s.manager()) == manager && s.feed0() == f0
+            && s.feed1() == f1 && s.bandBps() == sp.bandBps && s.maxDeviationTicks() == sp.maxDeviationTicks
+            && s.maxSteps() == sp.maxSteps && s.soldIsToken0() == sp.soldIsToken0;
     }
 
     function _deployHook(DeployTypes.Config memory cfg, Deployed memory d) internal returns (PegHook) {
